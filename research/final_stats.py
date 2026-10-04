@@ -1,0 +1,20 @@
+from families import *
+_dc=df[rth].groupby('sd').c.last()
+for wname in ('am','all'):
+    s=f6(th=0.16,stp='sw5',w=wname); T=run(df,s['sig'],s['dir'],s['stop'])
+    print(f"\n######## FINAL MBC window={wname}")
+    print("all 2023-2025:",stats(T))
+    for y in (2023,2024,2025): print(y,stats(T[T.ts.dt.year==y]))
+    q=T.groupby(T.ts.dt.to_period('Q')).win.agg(['size','mean']); print("quarters WR:",' '.join(f"{p}:{v*100:.0f}%({n})" for p,(n,v) in q.iterrows()))
+    si=T.si.values
+    T['hour']=((m[si]-1)//30)*30; T['hour']=T.hour.map(lambda x:f"{x//60:02d}:{x%60:02d}")
+    print("by 30-min slot:",T.groupby('hour').win.agg(['size','mean']).round(3).T.to_string())
+    T['side']=np.where(T.dir>0,'long','short'); print("by side:",T.groupby('side').win.agg(['size','mean']).round(3).to_dict())
+    rg=REG[si]; T['daily_trend']=np.where(rg==1,'bull(>SMA20)',np.where(rg==0,'bear(<SMA20)','na'))
+    T['with_trend']=np.where(((rg==1)&(T.dir>0))|((rg==0)&(T.dir<0)),'with','against')
+    print("by daily regime:",T.groupby('daily_trend').win.agg(['size','mean']).round(3).to_dict())
+    print("with/against daily trend:",T.groupby('with_trend').win.agg(['size','mean']).round(3).to_dict())
+    av=pd.Series(A[si]).rank(pct=True); T['vol']=pd.cut(av.values,[0,1/3,2/3,1],labels=['low','mid','high'])
+    print("by daily-ATR tercile:",T.groupby('vol',observed=True).win.agg(['size','mean']).round(3).to_dict())
+    T['dow']=T.ts.dt.day_name().str[:3]; print("by weekday:",T.groupby('dow').win.agg(['size','mean']).round(3).to_dict())
+    T.to_csv(f'final_trades_{wname}.csv',index=False)

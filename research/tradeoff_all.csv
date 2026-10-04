@@ -1,0 +1,8 @@
+fmin,IS_WR,N,WR,PF,ExpR,MaxDD_R,MaxLS,TPD,families,WR_by_quarter
+0.1,80.5,103,58.25,0.83,-0.072,12.1,4,0.2,"F11_z_lowvol,F14b_retrace_filtered,F6b_mom_refined",61 50 25 67 83 64 63 36
+0.2,77.6,132,59.09,0.88,-0.049,17.5,7,0.26,"F11_z_lowvol,F14b_retrace_filtered,F6b_mom_refined",61 64 0 67 62 46 90 36
+0.5,71.8,447,61.74,0.94,-0.023,18.4,6,0.89,"F12_time_drift,F19_trendday_pullback,F6b_mom_refined",62 67 60 62 53 65 60 66
+1.0,70.0,578,63.49,1.02,0.008,14.2,6,1.14,F6b_mom_refined,58 63 61 61 66 65 64 74
+2.0,66.8,1333,63.09,1.0,-0.001,49.3,8,2.64,"F14b_retrace_filtered,F6b_mom_refined",52 64 61 58 70 71 59 71
+3.0,66.3,1783,63.15,1.0,-0.001,61.4,11,3.53,"F11_z_lowvol,F6_mom_burst,F6b_mom_refined",66 59 54 65 70 58 63 71
+5.0,65.2,2993,63.21,1.0,0.001,38.0,10,5.93,"F6_mom_burst,F6b_mom_refined",57 65 62 64 62 62 64 67

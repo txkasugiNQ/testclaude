@@ -1,0 +1,238 @@
+//@version=6
+// ============================================================================
+//  MBC – Momentum Burst Continuation  |  NQ / MNQ  |  1-Minuten-Chart  |  RR 0.6
+// ----------------------------------------------------------------------------
+//  Regeln (identisch zur Python-Research-Engine, Parität bar-für-bar geprüft):
+//   • Tages-ATR  = SMA(14) der täglichen True Range, nur ABGESCHLOSSENE Tage
+//                  (request.security mit [1] + lookahead_on = offizielles No-Repaint-Muster)
+//   • Impuls     = close - close[5]
+//   • BUY-Signal : Impuls kreuzt über +0.16 × Tages-ATR   (SELL: unter -0.16 × ATR)
+//                  nur bei Bar-Schluss, im Fenster 09:35–11:30 ET (optional bis 15:30)
+//   • Stop       = tiefstes Tief der letzten 5 Bars − 1 Tick (Short: höchstes Hoch + 1 Tick)
+//   • Filter     = geschätzte Stop-Distanz (Close − Stop) zwischen 0.03 und 0.40 × ATR
+//   • Entry      = Market zur OPEN der nächsten Bar  →  R = Entry − Stop
+//   • Ziel       = Entry + 0.6 × R   (fix, keine Anpassung)
+//   • Exit       = SL / TP; beide in derselben Bar → SL (konservativ);
+//                  spätestens Close der 15:59-Bar (ET)
+//   • Nur eine Position gleichzeitig; Signale während offener Position oder auf der
+//     Exit-Bar werden ignoriert.
+//  Alle Signale werden nur auf BESTÄTIGTEN Bars erzeugt → kein Repainting.
+//  Chart: CME_MINI:NQ1! oder MNQ1!, 1 Minute, volle Globex-Session (ETH).
+// ============================================================================
+indicator("MBC – Momentum Burst Continuation (RR 0.6)", shorttitle = "MBC 0.6R", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpS = "Strategie (validierte Research-Werte)"
+thK      = input.float(0.16, "Impuls-Schwelle (× Tages-ATR)", minval = 0.01, step = 0.01, group = grpS)
+nLen     = input.int(5,    "Impuls-Länge (Bars)", minval = 2, group = grpS)
+swLen    = input.int(5,    "Swing-Stop Lookback (Bars)", minval = 2, group = grpS)
+rrK      = input.float(0.6, "Take-Profit (× R)", minval = 0.1, step = 0.05, group = grpS)
+atrLen   = input.int(14,   "Tages-ATR Länge (SMA der True Range)", minval = 1, group = grpS)
+minRk    = input.float(0.03, "Min. Stop-Distanz (× Tages-ATR)", step = 0.01, group = grpS)
+maxRk    = input.float(0.40, "Max. Stop-Distanz (× Tages-ATR)", step = 0.01, group = grpS)
+sessMode = input.string("Vormittag 09:35-11:30", "Signal-Fenster (New York)",
+     options = ["Vormittag 09:35-11:30", "Ganzer Tag 09:35-15:30"], group = grpS)
+
+grpP = "Phasen-Anzeige"
+setupK   = input.float(0.50, "Phase 1 SETUP ab (Anteil der Schwelle)", minval = 0.1, maxval = 0.99, step = 0.05, group = grpP)
+confK    = input.float(0.75, "Phase 2 CONFIRMATION ab (Anteil der Schwelle)", minval = 0.1, maxval = 0.99, step = 0.05, group = grpP)
+showTrig = input.bool(true, "Trigger-Linie anzeigen", group = grpP)
+showLvls = input.bool(true, "Entry / SL / TP Linien anzeigen", group = grpP)
+
+grpC = "Kosten-Modell (nur für die Statistik-Tabelle)"
+slipT    = input.int(1,     "Slippage Entry/Stop (Ticks)", minval = 0, group = grpC)
+ttrT     = input.int(1,     "TP muss durchgehandelt werden (Ticks)", minval = 0, group = grpC)
+commPts  = input.float(0.25, "Kommission + Gebühren Round-Trip (Punkte)", minval = 0, step = 0.05, group = grpC)
+showTbl  = input.bool(true, "Statistik-Tabelle anzeigen", group = grpC)
+
+// ───────────────────────────── Grundlagen ─────────────────────────────
+tz      = "America/New_York"
+winStr  = sessMode == "Vormittag 09:35-11:30" ? "0935-1130" : "0935-1530"
+inWin   = not na(time(timeframe.period, winStr, tz))
+flatBar = not na(time(timeframe.period, "1559-1600", tz)) or session.islastbar
+mt      = syminfo.mintick
+slip    = slipT * mt
+ttr     = ttrT * mt
+
+// Tages-ATR: Wert des VORTAGS (abgeschlossen) → kein Lookahead, kein Repaint
+atrD = request.security(syminfo.tickerid, "D", ta.sma(ta.tr(true), atrLen)[1], lookahead = barmerge.lookahead_on)
+
+thr  = thK * atrD
+r0   = close - close[nLen]
+r1   = close[1] - close[nLen + 1]
+llv  = ta.lowest(low, swLen)
+hhv  = ta.highest(high, swLen)
+
+// ───────────────────────────── Zustand ─────────────────────────────
+var int   pos      = 0
+var int   pend     = 0
+var float pStop    = na
+var float entry    = na
+var float stopPx   = na
+var float tpPx     = na
+var float riskPts  = na
+var int   entryBar = na
+var line  lnE      = na
+var line  lnS      = na
+var line  lnT      = na
+// Statistik
+var int   nTr      = 0
+var int   nWin     = 0
+var float sumWinR  = 0.0
+var float sumLossR = 0.0
+var float sumR     = 0.0
+var int   curLS    = 0
+var int   maxLS    = 0
+var int   nDays    = 0
+var int   lastDay  = na
+
+bool  sigLong   = false
+bool  sigShort  = false
+bool  exitTP    = false
+bool  exitSL    = false
+bool  exitTime  = false
+bool  filledNow = false
+int   exitDir   = 0
+float sigStop   = na
+
+if barstate.isconfirmed
+    // 1) Offene Market-Order zur Open dieser Bar füllen
+    if pend != 0
+        pos     := pend
+        pend    := 0
+        stopPx  := pStop
+        entry   := open + pos * slip
+        riskPts := (entry - stopPx) * pos
+        if riskPts <= mt
+            pos := 0
+        else
+            tpPx      := entry + pos * rrK * riskPts
+            entryBar  := bar_index
+            filledNow := true
+            dayKey = year * 10000 + month * 100 + dayofmonth
+            if na(lastDay) or dayKey != lastDay
+                nDays   += 1
+                lastDay := dayKey
+            if showLvls
+                lnE := line.new(bar_index, entry,  bar_index, entry,  color = color.new(color.gray, 0),  width = 2)
+                lnS := line.new(bar_index, stopPx, bar_index, stopPx, color = color.new(color.red, 0),   width = 2)
+                lnT := line.new(bar_index, tpPx,   bar_index, tpPx,   color = color.new(color.green, 0), width = 2)
+
+    // 2) Position managen (SL vor TP, konservativ)
+    if pos != 0
+        slHit = pos > 0 ? low <= stopPx : high >= stopPx
+        tpHit = pos > 0 ? high >= tpPx + ttr : low <= tpPx - ttr
+        float exitPx = na
+        if slHit
+            gapped = pos > 0 ? open < stopPx : open > stopPx
+            exitPx := (gapped and bar_index != entryBar ? open : stopPx) - pos * slip
+            exitSL := true
+        else if tpHit
+            exitPx := tpPx
+            exitTP := true
+        else if flatBar
+            exitPx   := close - pos * slip
+            exitTime := true
+        if showLvls and not na(lnE)
+            line.set_x2(lnE, bar_index)
+            line.set_x2(lnS, bar_index)
+            line.set_x2(lnT, bar_index)
+        if not na(exitPx)
+            pnl  = (exitPx - entry) * pos - commPts
+            rMul = pnl / riskPts
+            nTr  += 1
+            sumR += rMul
+            if pnl > 0
+                nWin    += 1
+                sumWinR += rMul
+                curLS   := 0
+            else
+                sumLossR += rMul
+                curLS    += 1
+                maxLS    := math.max(maxLS, curLS)
+            exitDir := pos
+            pos     := 0
+
+    // 3) Neues Signal bei Bar-Schluss (nur flat, keine Exit-Bar, keine offene Order)
+    exitedNow = exitTP or exitSL or exitTime
+    if pos == 0 and pend == 0 and not exitedNow and inWin and not na(thr)
+        int d = r0 > thr and r1 <= thr ? 1 : r0 < -thr and r1 >= -thr ? -1 : 0
+        if d != 0
+            st = d > 0 ? llv - mt : hhv + mt
+            rEst = (close - st) * d
+            if rEst >= minRk * atrD and rEst <= maxRk * atrD
+                pend    := d
+                pStop   := st
+                sigStop := st
+                sigLong  := d > 0
+                sigShort := d < 0
+
+// ───────────────────────────── Phasen 1 & 2 (nur Anzeige) ─────────────────────────────
+idle    = pos == 0 and pend == 0 and not sigLong and not sigShort
+ratio   = na(thr) or thr == 0 ? 0.0 : r0 / thr
+setupL  = barstate.isconfirmed and idle and inWin and ratio >=  setupK and r0 <=  thr
+setupS  = barstate.isconfirmed and idle and inWin and ratio <= -setupK and r0 >= -thr
+confL   = setupL and ratio >=  confK
+confS   = setupS and ratio <= -confK
+// Trigger-Preis für die NÄCHSTE Bar: Schlusskurs, ab dem der Impuls die Schwelle kreuzt
+trigL   = close[nLen - 1] + thr
+trigS   = close[nLen - 1] - thr
+
+plot(showTrig and setupL ? trigL : na, "Trigger Long",  color = confL ? color.new(color.lime, 0) : color.new(color.lime, 60), style = plot.style_linebr, linewidth = 2)
+plot(showTrig and setupS ? trigS : na, "Trigger Short", color = confS ? color.new(color.red, 0)  : color.new(color.red, 60),  style = plot.style_linebr, linewidth = 2)
+bgcolor(confL ? color.new(color.lime, 88) : setupL ? color.new(color.lime, 95) : na, title = "Phase Long")
+bgcolor(confS ? color.new(color.red, 88)  : setupS ? color.new(color.red, 95)  : na, title = "Phase Short")
+
+plotshape(setupL and not setupL[1], "SETUP Long",  shape.circle,   location.belowbar, color.new(color.lime, 40), size = size.tiny, text = "S", textcolor = color.new(color.lime, 0))
+plotshape(setupS and not setupS[1], "SETUP Short", shape.circle,   location.abovebar, color.new(color.red, 40),  size = size.tiny, text = "S", textcolor = color.new(color.red, 0))
+plotshape(confL and not confL[1],   "CONF Long",   shape.diamond,  location.belowbar, color.lime, size = size.tiny, text = "C", textcolor = color.lime)
+plotshape(confS and not confS[1],   "CONF Short",  shape.diamond,  location.abovebar, color.red,  size = size.tiny, text = "C", textcolor = color.red)
+
+// ───────────────────────────── Phase 3: ENTRY + Exits ─────────────────────────────
+plotshape(sigLong,  "BUY",  shape.labelup,   location.belowbar, color.new(color.green, 0), text = "BUY",  textcolor = color.white, size = size.small)
+plotshape(sigShort, "SELL", shape.labeldown, location.abovebar, color.new(color.red, 0),   text = "SELL", textcolor = color.white, size = size.small)
+plotshape(exitTP and exitDir > 0, "TP Long",  shape.xcross, location.abovebar, color.green, size = size.tiny, text = "TP")
+plotshape(exitTP and exitDir < 0, "TP Short", shape.xcross, location.belowbar, color.green, size = size.tiny, text = "TP")
+plotshape(exitSL and exitDir > 0, "SL Long",  shape.xcross, location.belowbar, color.red,   size = size.tiny, text = "SL")
+plotshape(exitSL and exitDir < 0, "SL Short", shape.xcross, location.abovebar, color.red,   size = size.tiny, text = "SL")
+plotshape(exitTime, "Zeit-Exit", shape.square, location.abovebar, color.orange, size = size.tiny, text = "T")
+plot(sigLong or sigShort ? sigStop : na, "Signal-Stop", color = color.new(color.red, 0), style = plot.style_circles, linewidth = 3)
+
+// ───────────────────────────── Alerts (nur bestätigte Bars) ─────────────────────────────
+alertcondition(setupL and not setupL[1], "MBC Long SETUP",  "MBC: Long-Setup baut sich auf (Impuls ≥ 50 % der Schwelle)")
+alertcondition(setupS and not setupS[1], "MBC Short SETUP", "MBC: Short-Setup baut sich auf (Impuls ≥ 50 % der Schwelle)")
+alertcondition(confL and not confL[1],   "MBC Long CONFIRMATION",  "MBC: Long-Confirmation (Impuls ≥ 75 % der Schwelle)")
+alertcondition(confS and not confS[1],   "MBC Short CONFIRMATION", "MBC: Short-Confirmation (Impuls ≥ 75 % der Schwelle)")
+alertcondition(sigLong,  "MBC BUY",  "MBC BUY: Entry zur nächsten Open, Stop am Signal-Stop, TP = Entry + 0.6R")
+alertcondition(sigShort, "MBC SELL", "MBC SELL: Entry zur nächsten Open, Stop am Signal-Stop, TP = Entry − 0.6R")
+if sigLong or sigShort
+    alert(str.format("MBC {0} | Stop {1} | Entry = nächste Open | TP = Entry {2} 0.6 × (Entry − Stop)",
+         sigLong ? "BUY" : "SELL", str.tostring(sigStop, format.mintick), sigLong ? "+" : "−"), alert.freq_once_per_bar_close)
+
+// ───────────────────────────── Statistik-Tabelle ─────────────────────────────
+var table tbl = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 20), border_width = 1)
+if showTbl and barstate.islast
+    wr  = nTr > 0 ? 100.0 * nWin / nTr : na
+    pf  = sumLossR < 0 ? sumWinR / -sumLossR : na
+    exR = nTr > 0 ? sumR / nTr : na
+    tpd = nDays > 0 ? nTr / nDays : na
+    ok1m = timeframe.isminutes and timeframe.multiplier == 1
+    table.cell(tbl, 0, 0, "MBC 0.6R", text_color = color.white)
+    table.cell(tbl, 1, 0, ok1m ? sessMode : "⚠ 1-Min-Chart nutzen!", text_color = ok1m ? color.white : color.orange)
+    table.cell(tbl, 0, 1, "Trades", text_color = color.white)
+    table.cell(tbl, 1, 1, str.tostring(nTr), text_color = color.white)
+    table.cell(tbl, 0, 2, "Winrate", text_color = color.white)
+    table.cell(tbl, 1, 2, na(wr) ? "-" : str.tostring(wr, "#.0") + " %", text_color = color.white)
+    table.cell(tbl, 0, 3, "Zufall (RR 0.6)", text_color = color.gray)
+    table.cell(tbl, 1, 3, "≈ 61–62 %", text_color = color.gray)
+    table.cell(tbl, 0, 4, "Profit Factor", text_color = color.white)
+    table.cell(tbl, 1, 4, na(pf) ? "-" : str.tostring(pf, "#.00"), text_color = color.white)
+    table.cell(tbl, 0, 5, "Expectancy (R)", text_color = color.white)
+    table.cell(tbl, 1, 5, na(exR) ? "-" : str.tostring(exR, "#.000"), text_color = color.white)
+    table.cell(tbl, 0, 6, "Max. Verlustserie", text_color = color.white)
+    table.cell(tbl, 1, 6, str.tostring(maxLS), text_color = color.white)
+    table.cell(tbl, 0, 7, "Trades / aktiver Tag", text_color = color.white)
+    table.cell(tbl, 1, 7, na(tpd) ? "-" : str.tostring(tpd, "#.00"), text_color = color.white)
+    table.cell(tbl, 0, 8, "Kosten-Modell", text_color = color.gray)
+    table.cell(tbl, 1, 8, str.format("{0}T Slip, {1} Pkt", slipT, commPts), text_color = color.gray)
