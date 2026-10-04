@@ -113,3 +113,157 @@ def stats(T,days=None):
 def wf_windows():
     q=pd.date_range('2024-01-01','2026-01-01',freq='QS')
     return [(a-pd.DateOffset(months=12),a,b) for a,b in zip(q[:-1],q[1:])]
+
+@nb.njit(cache=True)
+def simulate2(o,h,l,c,sig,dirn,etype,epx,stop,expiry,flat,rr,be_at,trail_k,max_bars,tick,comm):
+    """Like simulate() plus management (all decided with info up to the PREVIOUS bar's close):
+    rr: target in R (>=1e5 = no target); be_at: move stop to entry+1tick once MFE >= be_at R (0=off);
+    trail_k: stop trails at best extreme since entry -/+ trail_k R (0=off); max_bars: time stop (0=off).
+    Stop updates take effect from the NEXT bar (conservative). Same-bar SL+TP => SL."""
+    n=len(sig); out=np.full((n,8),np.nan); busy=-1; k=0
+    for s in range(n):
+        t=sig[s]
+        if t<=busy: continue
+        d=dirn[s]; st=stop[s]
+        if etype[s]==0:
+            j=t+1
+            if j>=len(o) or j>flat[t]: continue
+            fill=o[j]+d*tick; chk=True
+        else:
+            px=epx[s]; j=t+1; fill=np.nan
+            while j<=expiry[s] and j<=flat[t]:
+                if (d>0 and l[j]<=px-tick) or (d<0 and h[j]>=px+tick):
+                    fill=px; break
+                j+=1
+            if np.isnan(fill):
+                busy=min(expiry[s],flat[t]); continue
+            chk=False
+        R=(fill-st)*d
+        if R<=tick: continue
+        tp=fill+d*rr*R; first=j; fe=flat[first]; e=first; code=-1; ex=np.nan
+        cur=st; best=fill
+        while e<=fe:
+            if d>0: slh=l[e]<=cur; tph=h[e]>=tp+tick
+            else:   slh=h[e]>=cur; tph=l[e]<=tp-tick
+            if e==first and not chk: tph=False
+            if slh:
+                gap=(o[e]<cur) if d>0 else (o[e]>cur)
+                ex=(o[e] if (gap and e!=first) else cur)-d*tick; code=0; break
+            if tph:
+                ex=tp; code=1; break
+            if max_bars>0 and e-first+1>=max_bars:
+                ex=c[e]-d*tick; code=3; break
+            # update management state with this (completed) bar -> effective next bar
+            best=max(best,h[e]) if d>0 else min(best,l[e])
+            mfe=(best-fill)*d/R
+            if be_at>0 and mfe>=be_at:
+                nb_=fill+d*tick
+                cur=max(cur,nb_) if d>0 else min(cur,nb_)
+            if trail_k>0:
+                ts=best-d*trail_k*R
+                cur=max(cur,ts) if d>0 else min(cur,ts)
+            e+=1
+        if code==-1:
+            e=fe; ex=c[e]-d*tick; code=2
+        out[k,0]=first; out[k,1]=e; out[k,2]=fill; out[k,3]=R; out[k,4]=(ex-fill)*d-comm; out[k,5]=code; out[k,6]=t; out[k,7]=d
+        k+=1; busy=e
+    return out[:k]
+
+def run2(df,sig,dirn,stop,rr=1e6,be_at=0.0,trail_k=0.0,max_bars=0,etype=None,epx=None,expiry=None,flat=None):
+    n=len(sig)
+    if n==0: return pd.DataFrame(columns=['ei','xi','fill','R','pnl','code','si','dir','ts','sd','win','pnlR'])
+    if etype is None: etype=np.zeros(n,np.int64)
+    if epx is None: epx=np.full(n,np.nan)
+    if expiry is None: expiry=np.asarray(sig,np.int64)
+    if flat is None: flat=df['flat_rth'].values
+    order=np.argsort(sig,kind='stable')
+    r=simulate2(df.o.values,df.h.values,df.l.values,df.c.values,np.asarray(sig,np.int64)[order],
+               np.asarray(dirn,np.float64)[order],np.asarray(etype,np.int64)[order],np.asarray(epx,np.float64)[order],
+               np.asarray(stop,np.float64)[order],np.asarray(expiry,np.int64)[order],np.asarray(flat,np.int64),
+               float(rr),float(be_at),float(trail_k),int(max_bars),TICK,COMM)
+    T=pd.DataFrame(r,columns=['ei','xi','fill','R','pnl','code','si','dir'])
+    for kk in ['ei','xi','code','si']: T[kk]=T[kk].astype(int)
+    T['ts']=df.ts.values[T.ei.values]; T['sd']=df.sd.values[T.ei.values]
+    T['win']=T.pnl>0; T['pnlR']=T.pnl/T.R
+    return T
+
+def stats2(T,days=None):
+    """stats + PF in points (equal 1 contract) and daily-R Sharpe"""
+    s=stats(T,days)
+    if len(T)==0: return s
+    gp=T.pnl[T.pnl>0].sum(); gl=-T.pnl[T.pnl<0].sum()
+    s['PF_pts']=round(gp/gl,2) if gl>0 else np.inf
+    dr=T.groupby('sd').pnlR.sum()
+    s['SharpeD']=round(dr.mean()/dr.std()*np.sqrt(252),2) if dr.std()>0 else np.nan
+    return s
+
+@nb.njit(cache=True)
+def simulate_oco(o,h,l,c,sig,pxL,slL,pxS,slS,expiry,flat,rr,max_bars,tick,comm,slip_ticks,cancel_inv=False):
+    """OCO bracket of STOP-entry orders placed at close of bar sig[s], valid bars sig+1..expiry[s].
+    Long fills if high >= pxL at max(pxL, open) + slippage; short symmetric. If both trigger in the same
+    bar, the side whose trigger is nearer the bar open is assumed first (the other side is cancelled),
+    and on the fill bar only the stop is checked (conservative). rr>=1e5 -> no target (hold to flat/time stop)."""
+    n=len(sig); out=np.full((n,8),np.nan); busy=-1; k=0; sl=slip_ticks*tick
+    for s in range(n):
+        t=sig[s]
+        if t<=busy: continue
+        j=t+1; d=0.0; fill=np.nan; st=np.nan
+        cancelled=False
+        while j<=expiry[s] and j<=flat[t]:
+            lt=(not np.isnan(pxL[s])) and h[j]>=pxL[s]
+            stt=(not np.isnan(pxS[s])) and l[j]<=pxS[s]
+            if cancel_inv:
+                # invalidation: protective-stop level traded before the entry level -> cancel (conservative: same bar = cancel)
+                invL=(not np.isnan(pxL[s])) and l[j]<=slL[s]
+                invS=(not np.isnan(pxS[s])) and h[j]>=slS[s]
+                if (invL and np.isnan(pxS[s])) or (invS and np.isnan(pxL[s])):
+                    cancelled=True; break
+            if lt and stt:
+                if abs(o[j]-pxL[s])<=abs(o[j]-pxS[s]): stt=False
+                else: lt=False
+            if lt:
+                d=1.0; fill=max(pxL[s],o[j])+sl; st=slL[s]; break
+            if stt:
+                d=-1.0; fill=min(pxS[s],o[j])-sl; st=slS[s]; break
+            j+=1
+        if cancelled:
+            busy=j; continue
+        if d==0.0:
+            busy=min(expiry[s],flat[t]); continue
+        R=(fill-st)*d
+        if R<=tick:
+            busy=j; continue
+        tp=fill+d*rr*R; first=j; fe=flat[first]; e=first; code=-1; ex=np.nan
+        while e<=fe:
+            if d>0: slh=l[e]<=st; tph=h[e]>=tp+tick
+            else:   slh=h[e]>=st; tph=l[e]<=tp-tick
+            if e==first: tph=False
+            if slh:
+                gap=(o[e]<st) if d>0 else (o[e]>st)
+                ex=(o[e] if (gap and e!=first) else st)-d*sl; code=0; break
+            if tph:
+                ex=tp; code=1; break
+            if max_bars>0 and e-first+1>=max_bars:
+                ex=c[e]-d*sl; code=3; break
+            e+=1
+        if code==-1:
+            e=fe; ex=c[e]-d*sl; code=2
+        out[k,0]=first; out[k,1]=e; out[k,2]=fill; out[k,3]=R; out[k,4]=(ex-fill)*d-comm; out[k,5]=code; out[k,6]=t; out[k,7]=d
+        k+=1; busy=e
+    return out[:k]
+
+def run_oco(df,sig,pxL,slL,pxS,slS,expiry=None,rr=1e6,max_bars=0,flat=None,slip_ticks=1,cancel_inv=False):
+    sig=np.asarray(sig,np.int64); n=len(sig)
+    cols=['ei','xi','fill','R','pnl','code','si','dir']
+    if n==0: return pd.DataFrame(columns=cols+['ts','sd','win','pnlR'])
+    if expiry is None: expiry=sig+1
+    if flat is None: flat=df['flat_rth'].values
+    order=np.argsort(sig,kind='stable')
+    f=lambda x: np.asarray(x,np.float64)[order]
+    r=simulate_oco(df.o.values,df.h.values,df.l.values,df.c.values,sig[order],f(pxL),f(slL),f(pxS),f(slS),
+                   np.asarray(expiry,np.int64)[order],np.asarray(flat,np.int64),float(rr),int(max_bars),TICK,COMM,int(slip_ticks),bool(cancel_inv))
+    T=pd.DataFrame(r,columns=cols)
+    for kk in ['ei','xi','code','si']: T[kk]=T[kk].astype(int)
+    T['ts']=df.ts.values[T.ei.values]; T['sd']=df.sd.values[T.ei.values]
+    T['win']=T.pnl>0; T['pnlR']=T.pnl/T.R
+    return T

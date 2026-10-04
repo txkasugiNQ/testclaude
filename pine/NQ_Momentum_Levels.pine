@@ -1,0 +1,344 @@
+//@version=6
+// ============================================================================
+//  NQ MOMENTUM LEVELS  —  MBL (Momentum Burst Level) + OBR (Opening Bar Range)
+//  NQ1! / MNQ1!  ·  1-Minuten-Chart  ·  volle Globex-Session  ·  Zeitzone New York
+// ----------------------------------------------------------------------------
+//  Research: Python-Walk-Forward auf NQ 1m (12/2022–12/2025). Kosten: 1 Tick Slippage
+//  auf Entry/Stop/Exit + 0.25 Pkt Kommission. Diese Regeln sind bar-für-bar identisch mit
+//  research/pine_replica2.py (Trade-für-Trade-Parität zur Backtest-Engine geprüft).
+//
+//  MBL – Momentum Burst Level (09:35–15:30 ET)
+//   PHASE 1 SETUP     : Impuls (close − close[5]) erreicht ≥ 50 % der Schwelle → vorläufiges Level
+//   PHASE 2 CONFIRM   : Impuls ≥ 75 % der Schwelle
+//   PHASE 3 LEVEL     : Impuls kreuzt ±0.12 × Tages-ATR (Bar-Schluss) →
+//                       LONG LEVEL  = Buy-Stop  1 Tick über dem 5-Bar-Hoch
+//                       SHORT LEVEL = Sell-Stop 1 Tick unter dem 5-Bar-Tief
+//                       Stop        = andere Seite der 5-Bar-Range ± 1 Tick
+//                       gültig 5 Bars; INVALID, wenn der Stop vor dem Entry gehandelt wird
+//   PHASE 4 MANAGEMENT: Stop fix; kein festes Target (Momentum-Trades laufen bis 15:59-Close)
+//  OBR – Opening Bar Range (09:30-Kerze)
+//   Kerzenkörper > 0.03 × Tages-ATR → Entry zur 09:31-Open in Körperrichtung,
+//   Stop jenseits der Eröffnungskerze, Exit Stop oder 15:59-Close.
+//  Kein Repainting: alle Zustandswechsel nur auf bestätigten Bars; Tages-ATR = Vortageswert.
+// ============================================================================
+indicator("NQ Momentum Levels (MBL + OBR)", shorttitle = "NQ Levels", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ───────────── Inputs ─────────────
+gM = "MBL – Momentum Burst Level"
+useMBL  = input.bool(true,  "MBL aktiv", group = gM)
+thK     = input.float(0.12, "Impuls-Schwelle (× Tages-ATR)", minval = 0.01, step = 0.01, group = gM)
+nLen    = input.int(5,      "Impuls- & Level-Lookback (Bars)", minval = 2, group = gM)
+validN  = input.int(5,      "Level gültig (Bars)", minval = 1, group = gM)
+minWk   = input.float(0.02, "Min. Level-Range (× ATR)", step = 0.01, group = gM)
+maxWk   = input.float(0.60, "Max. Level-Range (× ATR)", step = 0.05, group = gM)
+gO = "OBR – Opening Bar Range"
+useOBR  = input.bool(true,  "OBR aktiv", group = gO)
+obK     = input.float(0.03, "Min. Kerzenkörper 09:30 (× Tages-ATR)", step = 0.01, group = gO)
+gD = "Darstellung"
+showSetup = input.bool(true, "Phase 1/2 (Level im Aufbau) anzeigen", group = gD)
+showRef   = input.bool(true, "1R/2R/3R-Referenzlinien (keine Exits!)", group = gD)
+histDays  = input.int(5,     "Zeichnungen behalten (Tage)", minval = 1, maxval = 60, group = gD)
+cLong     = input.color(color.new(#26a69a, 0), "Farbe Long", group = gD)
+cShort    = input.color(color.new(#ef5350, 0), "Farbe Short", group = gD)
+gC = "Kosten-Modell (Statistik)"
+atrLen  = input.int(14,     "Tages-ATR Länge (SMA der True Range)", minval = 1, group = gC)
+slipT   = input.int(1,      "Slippage (Ticks) Entry/Stop/Exit", minval = 0, group = gC)
+commPts = input.float(0.25, "Kommission Round-Trip (Punkte)", minval = 0, step = 0.05, group = gC)
+showTbl = input.bool(true,  "Statistik-Tabelle", group = gC)
+
+// ───────────── Basis ─────────────
+tz      = "America/New_York"
+mt      = syminfo.mintick
+slip    = slipT * mt
+inWin   = not na(time(timeframe.period, "0935-1530", tz))
+obBar   = not na(time(timeframe.period, "0930-0931", tz))
+flatBar = not na(time(timeframe.period, "1559-1600", tz)) or session.islastbar
+atrD    = request.security(syminfo.tickerid, "D", ta.sma(ta.tr(true), atrLen)[1], lookahead = barmerge.lookahead_on)
+thr     = thK * atrD
+r0      = close - close[nLen]
+r1      = close[1] - close[nLen + 1]
+hiN     = ta.highest(high, nLen)
+loN     = ta.lowest(low, nLen)
+fmt(float x) => str.tostring(x, format.mintick)
+
+// ───────────── Zeichnungs-Archiv (alte Tage ausblenden) ─────────────
+var array<box>   aBox  = array.new<box>()
+var array<int>   aBoxT = array.new<int>()
+var array<line>  aLn   = array.new<line>()
+var array<int>   aLnT  = array.new<int>()
+var array<label> aLb   = array.new<label>()
+var array<int>   aLbT  = array.new<int>()
+regBox(box b) =>
+    array.push(aBox, b)
+    array.push(aBoxT, time)
+    b
+regLn(line x) =>
+    array.push(aLn, x)
+    array.push(aLnT, time)
+    x
+regLb(label x) =>
+    array.push(aLb, x)
+    array.push(aLbT, time)
+    x
+prune(int cutoff) =>
+    while array.size(aBoxT) > 0 and array.get(aBoxT, 0) < cutoff
+        box.delete(array.shift(aBox))
+        array.shift(aBoxT)
+    while array.size(aLnT) > 0 and array.get(aLnT, 0) < cutoff
+        line.delete(array.shift(aLn))
+        array.shift(aLnT)
+    while array.size(aLbT) > 0 and array.get(aLbT, 0) < cutoff
+        label.delete(array.shift(aLb))
+        array.shift(aLbT)
+if ta.change(time("D")) != 0
+    prune(time - histDays * 86400000)
+
+// ───────────── Statistik (UDT, damit Funktionen Felder ändern dürfen) ─────────────
+type Stats
+    int   n       = 0
+    int   w       = 0
+    float gw      = 0.0
+    float gl      = 0.0
+    float eq      = 0.0
+    float pk      = 0.0
+    float dd      = 0.0
+    int   days    = 0
+    int   lastDay = 0
+var Stats sAll = Stats.new()
+var Stats sMbl = Stats.new()
+var Stats sObr = Stats.new()
+addTrade(Stats s, float rr) =>
+    s.n  += 1
+    s.eq += rr
+    s.pk := math.max(s.pk, s.eq)
+    s.dd := math.max(s.dd, s.pk - s.eq)
+    if rr > 0
+        s.w  += 1
+        s.gw += rr
+    else
+        s.gl -= rr
+    rr
+book(float pnl, float risk, bool isMBL) =>
+    rr = pnl / risk
+    addTrade(sAll, rr)
+    addTrade(isMBL ? sMbl : sObr, rr)
+    rr
+markDay() =>
+    dk = year * 10000 + month * 100 + dayofmonth
+    if dk != sAll.lastDay
+        sAll.days    += 1
+        sAll.lastDay := dk
+pfStr(Stats s) => s.gl > 0 ? str.tostring(s.gw / s.gl, "#.00") : "-"
+
+// ───────────── MBL-Zustand ─────────────
+var int   mbPend  = 0
+var float mbPx    = na
+var float mbSl    = na
+var int   mbExp   = na
+var int   mbPos   = 0
+var float mbEntry = na
+var float mbStop  = na
+var float mbR     = na
+var int   mbEB    = na
+var int   mbBusy  = -1
+var box   mbBox   = na
+var label mbLbl   = na
+var line  mbLnE   = na
+var line  mbLnS   = na
+var line  mbLn1   = na
+var line  mbLn2   = na
+var line  mbLn3   = na
+// ───────────── OBR-Zustand ─────────────
+var int   obPend  = 0
+var float obSt    = na
+var int   obPos   = 0
+var float obEntry = na
+var float obStop  = na
+var float obR     = na
+var int   obEB    = na
+var line  obLnE   = na
+var line  obLnS   = na
+var label obLbl   = na
+
+bool evLevel = false
+bool evFill  = false
+bool evExit  = false
+bool evOBR   = false
+
+if barstate.isconfirmed
+    // ===== MBL 1) offene Stop-Order =====
+    if useMBL and mbPend != 0
+        cancelHit = mbPend > 0 ? low <= mbSl : high >= mbSl
+        trig      = mbPend > 0 ? high >= mbPx : low <= mbPx
+        if cancelHit
+            box.set_border_color(mbBox, color.gray)
+            box.set_bgcolor(mbBox, color.new(color.gray, 90))
+            box.set_right(mbBox, bar_index)
+            label.set_text(mbLbl, (mbPend > 0 ? "LONG" : "SHORT") + " LEVEL · INVALID (Stop vor Entry)")
+            label.set_textcolor(mbLbl, color.gray)
+            mbPend := 0
+            mbBusy := bar_index
+        else if trig
+            mbEntry := (mbPend > 0 ? math.max(mbPx, open) : math.min(mbPx, open)) + mbPend * slip
+            mbPos   := mbPend
+            mbStop  := mbSl
+            mbR     := (mbEntry - mbStop) * mbPos
+            mbEB    := bar_index
+            mbPend  := 0
+            if mbR <= mt
+                mbPos  := 0
+                mbBusy := bar_index
+            else
+                evFill := true
+                markDay()
+                cc = mbPos > 0 ? cLong : cShort
+                box.set_right(mbBox, bar_index)
+                mbLnE := regLn(line.new(bar_index, mbEntry, bar_index, mbEntry, color = cc, width = 2))
+                mbLnS := regLn(line.new(bar_index, mbStop,  bar_index, mbStop,  color = color.new(color.red, 0), width = 2))
+                if showRef
+                    mbLn1 := regLn(line.new(bar_index, mbEntry + mbPos * mbR,     bar_index, mbEntry + mbPos * mbR,     color = color.new(cc, 50), style = line.style_dotted))
+                    mbLn2 := regLn(line.new(bar_index, mbEntry + mbPos * 2 * mbR, bar_index, mbEntry + mbPos * 2 * mbR, color = color.new(cc, 50), style = line.style_dotted))
+                    mbLn3 := regLn(line.new(bar_index, mbEntry + mbPos * 3 * mbR, bar_index, mbEntry + mbPos * 3 * mbR, color = color.new(cc, 50), style = line.style_dotted))
+                label.set_text(mbLbl, (mbPos > 0 ? "LONG" : "SHORT") + " AKTIV · Entry " + fmt(mbEntry) + " · Stop " + fmt(mbStop) + " · R " + fmt(mbR) + "\nExit: Stop oder 15:59 Close")
+        else if bar_index >= mbExp or flatBar
+            box.set_border_color(mbBox, color.gray)
+            box.set_bgcolor(mbBox, color.new(color.gray, 92))
+            label.set_text(mbLbl, (mbPend > 0 ? "LONG" : "SHORT") + " LEVEL · EXPIRED")
+            label.set_textcolor(mbLbl, color.gray)
+            mbPend := 0
+            mbBusy := bar_index
+
+    // ===== MBL 2) Position managen =====
+    if mbPos != 0
+        hit = mbPos > 0 ? low <= mbStop : high >= mbStop
+        float ex = na
+        if hit
+            gapped = mbPos > 0 ? open < mbStop : open > mbStop
+            ex := (gapped and bar_index != mbEB ? open : mbStop) - mbPos * slip
+        else if flatBar
+            ex := close - mbPos * slip
+        for ln in array.from(mbLnE, mbLnS, mbLn1, mbLn2, mbLn3)
+            if not na(ln)
+                line.set_x2(ln, bar_index)
+        if not na(ex)
+            res = book((ex - mbEntry) * mbPos - commPts, mbR, true)
+            regLb(label.new(bar_index, ex, (res >= 0 ? "+" : "") + str.tostring(res, "#.0") + "R", style = label.style_label_left,
+                 color = color.new(res >= 0 ? cLong : cShort, 70), textcolor = color.white, size = size.tiny))
+            mbPos  := 0
+            mbBusy := bar_index
+            evExit := true
+            mbLnE := na
+            mbLnS := na
+            mbLn1 := na
+            mbLn2 := na
+            mbLn3 := na
+
+    // ===== MBL 3) neues Level (Phase 3) =====
+    if useMBL and mbPend == 0 and mbPos == 0 and bar_index > mbBusy and inWin and not na(thr)
+        int d = r0 > thr and r1 <= thr ? 1 : r0 < -thr and r1 >= -thr ? -1 : 0
+        if d != 0 and hiN - loN >= minWk * atrD and hiN - loN <= maxWk * atrD and not flatBar
+            mbPend := d
+            mbPx   := d > 0 ? hiN + mt : loN - mt
+            mbSl   := d > 0 ? loN - mt : hiN + mt
+            mbExp  := bar_index + validN
+            evLevel := true
+            cc = d > 0 ? cLong : cShort
+            mbBox := regBox(box.new(bar_index, math.max(mbPx, mbSl), bar_index + validN, math.min(mbPx, mbSl),
+                 border_color = cc, border_width = 1, bgcolor = color.new(cc, 88)))
+            mbLbl := regLb(label.new(bar_index + validN, mbPx,
+                 (d > 0 ? "LONG LEVEL · Buy-Stop " : "SHORT LEVEL · Sell-Stop ") + fmt(mbPx) + "\nStop " + fmt(mbSl) + " · R≈" + fmt(math.abs(mbPx - mbSl)) + " · gültig " + str.tostring(validN) + " Bars",
+                 style = label.style_label_left, color = color.new(cc, 20), textcolor = color.white, size = size.small))
+
+    // ===== OBR 1) Market-Entry zur Open nach der 09:30-Kerze =====
+    if obPend != 0
+        obEntry := open + obPend * slip
+        obPos   := obPend
+        obStop  := obSt
+        obR     := (obEntry - obStop) * obPos
+        obEB    := bar_index
+        obPend  := 0
+        if obR <= mt
+            obPos := 0
+        else
+            evFill := true
+            markDay()
+            cc = obPos > 0 ? cLong : cShort
+            obLnE := regLn(line.new(bar_index, obEntry, bar_index, obEntry, color = cc, width = 2, style = line.style_dashed))
+            obLnS := regLn(line.new(bar_index, obStop,  bar_index, obStop,  color = color.new(color.red, 0), width = 1, style = line.style_dashed))
+            label.set_text(obLbl, "OBR " + (obPos > 0 ? "LONG" : "SHORT") + " AKTIV · Entry " + fmt(obEntry) + " · Stop " + fmt(obStop) + "\nExit: Stop oder 15:59 Close")
+    // ===== OBR 2) Position managen =====
+    if obPos != 0
+        hit = obPos > 0 ? low <= obStop : high >= obStop
+        float ex = na
+        if hit
+            gapped = obPos > 0 ? open < obStop : open > obStop
+            ex := (gapped and bar_index != obEB ? open : obStop) - obPos * slip
+        else if flatBar
+            ex := close - obPos * slip
+        if not na(obLnE)
+            line.set_x2(obLnE, bar_index)
+            line.set_x2(obLnS, bar_index)
+        if not na(ex)
+            res = book((ex - obEntry) * obPos - commPts, obR, false)
+            regLb(label.new(bar_index, ex, "OBR " + (res >= 0 ? "+" : "") + str.tostring(res, "#.0") + "R", style = label.style_label_left,
+                 color = color.new(res >= 0 ? cLong : cShort, 70), textcolor = color.white, size = size.tiny))
+            obPos  := 0
+            evExit := true
+    // ===== OBR 3) Signal auf der 09:30-Kerze =====
+    if useOBR and obBar and obPos == 0 and not na(atrD)
+        body = close - open
+        if math.abs(body) > obK * atrD
+            d  = body > 0 ? 1 : -1
+            st = d > 0 ? low - mt : high + mt
+            rE = (close - st) * d
+            if rE >= 0.02 * atrD and rE <= 0.6 * atrD and not flatBar
+                obPend := d
+                obSt   := st
+                evOBR  := true
+                cc = d > 0 ? cLong : cShort
+                regBox(box.new(bar_index, high, bar_index + 1, low, border_color = cc, bgcolor = color.new(cc, 80)))
+                obLbl := regLb(label.new(bar_index, d > 0 ? high : low,
+                     "OBR " + (d > 0 ? "LONG" : "SHORT") + " · Entry 09:31-Open · Stop " + fmt(st),
+                     style = d > 0 ? label.style_label_lower_left : label.style_label_upper_left, color = color.new(cc, 20), textcolor = color.white, size = size.small))
+
+// ───────────── Phase 1 / 2: Level im Aufbau (nur Anzeige) ─────────────
+idle   = useMBL and mbPend == 0 and mbPos == 0 and not evLevel and bar_index > mbBusy
+ratio  = na(thr) or thr == 0 ? 0.0 : r0 / thr
+setupL = barstate.isconfirmed and idle and inWin and ratio >=  0.5 and r0 <=  thr
+setupS = barstate.isconfirmed and idle and inWin and ratio <= -0.5 and r0 >= -thr
+confL  = setupL and ratio >=  0.75
+confS  = setupS and ratio <= -0.75
+plot(showSetup and setupL ? hiN + mt : na, "Long-Level im Aufbau",  color = color.new(cLong,  confL ? 0 : 65), style = plot.style_linebr, linewidth = confL ? 2 : 1)
+plot(showSetup and setupS ? loN - mt : na, "Short-Level im Aufbau", color = color.new(cShort, confS ? 0 : 65), style = plot.style_linebr, linewidth = confS ? 2 : 1)
+
+// ───────────── Alerts ─────────────
+alertcondition(confL and not confL[1], "MBL Long Confirmation", "NQ Levels: Long-Level baut sich auf (Impuls ≥ 75 %)")
+alertcondition(confS and not confS[1], "MBL Short Confirmation", "NQ Levels: Short-Level baut sich auf (Impuls ≥ 75 %)")
+alertcondition(evLevel, "MBL Level gesetzt", "NQ Levels: neues MBL-Level (Stop-Order) gesetzt")
+alertcondition(evOBR,   "OBR Signal", "NQ Levels: OBR – Entry zur 09:31-Open")
+alertcondition(evFill,  "Entry ausgeführt", "NQ Levels: Entry ausgeführt")
+alertcondition(evExit,  "Exit", "NQ Levels: Position geschlossen")
+if evLevel
+    alert("MBL " + (mbPend > 0 ? "LONG Buy-Stop " : "SHORT Sell-Stop ") + fmt(mbPx) + " | Stop " + fmt(mbSl) + " | gültig " + str.tostring(validN) + " Bars", alert.freq_once_per_bar_close)
+
+// ───────────── Statistik-Tabelle ─────────────
+var table tb = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 25), border_width = 1)
+if showTbl and barstate.islast
+    ok1 = timeframe.isminutes and timeframe.multiplier == 1
+    table.cell(tb, 0, 0, "NQ Levels", text_color = color.white)
+    table.cell(tb, 1, 0, ok1 ? "1m ✓" : "⚠ 1-Min-Chart!", text_color = ok1 ? color.white : color.orange)
+    table.cell(tb, 0, 1, "Trades gesamt", text_color = color.white)
+    table.cell(tb, 1, 1, str.tostring(sAll.n), text_color = color.white)
+    table.cell(tb, 0, 2, "Winrate", text_color = color.white)
+    table.cell(tb, 1, 2, sAll.n > 0 ? str.tostring(100.0 * sAll.w / sAll.n, "#.0") + " %" : "-", text_color = color.white)
+    table.cell(tb, 0, 3, "PF gesamt (R)", text_color = color.white)
+    table.cell(tb, 1, 3, pfStr(sAll), text_color = color.white)
+    table.cell(tb, 0, 4, "PF MBL / OBR", text_color = color.white)
+    table.cell(tb, 1, 4, pfStr(sMbl) + " / " + pfStr(sObr), text_color = color.white)
+    table.cell(tb, 0, 5, "Expectancy", text_color = color.white)
+    table.cell(tb, 1, 5, sAll.n > 0 ? str.tostring(sAll.eq / sAll.n, "#.000") + " R" : "-", text_color = color.white)
+    table.cell(tb, 0, 6, "Max. Drawdown", text_color = color.white)
+    table.cell(tb, 1, 6, str.tostring(sAll.dd, "#.0") + " R", text_color = color.white)
+    table.cell(tb, 0, 7, "Trades / aktiver Tag", text_color = color.white)
+    table.cell(tb, 1, 7, sAll.days > 0 ? str.tostring(sAll.n / sAll.days, "#.00") : "-", text_color = color.white)
