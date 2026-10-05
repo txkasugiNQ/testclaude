@@ -363,3 +363,49 @@ def streak_stats(T):
         elif cur>0: ep.append(cur); cur=0
     if cur>0: ep.append(cur)
     return dict(avgLS=round(st.mean(),2),maxLS=int(st.max()),p90LS=int(np.quantile(st,0.9)),avgDD=round(np.mean(ep) if ep else 0,2),maxDD=round(dd.max(),1))
+
+@nb.njit(cache=True)
+def simulate_mkt_partial(o,h,l,c,sig,dirn,stop,tp_abs,flat,t1,frac1,be,tick,comm):
+    """market entry at next open (+1 tick); stop fixed; optional partial (frac1 at t1*R, limit trade-through), BE for the rest
+    (from next bar); remainder exits at tp_abs (absolute price, nan = none) or stop or flat. One position at a time."""
+    n=len(sig); out=np.full((n,10),np.nan); busy=-1; k=0
+    for s in range(n):
+        t=sig[s]
+        if t<=busy: continue
+        j=t+1
+        if j>=len(o) or j>flat[t]: continue
+        d=dirn[s]; fill=o[j]+d*tick; st=stop[s]; R=(fill-st)*d
+        if R<=tick: continue
+        tp1=fill+d*t1*R; tp=tp_abs[s]
+        if not np.isnan(tp) and (tp-fill)*d<=0: tp=np.nan
+        fe=flat[j]; e=j; part=False; rem=1.0; pnl=0.0; cur=st; pbe=False; mae=0.0; mfe=0.0
+        while e<=fe:
+            if pbe:
+                cur=max(cur,fill+tick) if d>0 else min(cur,fill-tick); pbe=False
+            slh=(l[e]<=cur) if d>0 else (h[e]>=cur)
+            if slh:
+                gap=(o[e]<cur) if d>0 else (o[e]>cur)
+                ex=(o[e] if (gap and e!=j) else cur)-d*tick; pnl+=rem*(ex-fill)*d; rem=0.0; mae=max(mae,(fill-cur)*d); break
+            mae=max(mae,((fill-l[e]) if d>0 else (h[e]-fill))); mfe=max(mfe,((h[e]-fill) if d>0 else (fill-l[e])))
+            if (not part) and t1>0 and (((h[e]>=tp1+tick) if d>0 else (l[e]<=tp1-tick))):
+                pnl+=frac1*(tp1-fill)*d; rem-=frac1; part=True
+                if be: pbe=True
+            if rem>1e-9 and not np.isnan(tp) and (((h[e]>=tp+tick) if d>0 else (l[e]<=tp-tick))):
+                pnl+=rem*(tp-fill)*d; rem=0.0; break
+            e+=1
+        if rem>1e-9:
+            if e>fe: e=fe
+            pnl+=rem*(c[e]-d*tick-fill)*d
+        out[k,0]=j; out[k,1]=e; out[k,2]=fill; out[k,3]=R; out[k,4]=pnl-comm; out[k,5]=t; out[k,6]=d; out[k,7]=mae/R; out[k,8]=mfe/R; out[k,9]=e-j+1
+        k+=1; busy=e
+    return out[:k]
+def run_mp(df,sig,dirn,stop,tp_abs=None,t1=0.0,frac1=0.5,be=False):
+    sig=np.asarray(sig,np.int64); n=len(sig)
+    if tp_abs is None: tp_abs=np.full(n,np.nan)
+    o_=np.argsort(sig,kind='stable'); f=lambda x: np.asarray(x,np.float64)[o_]
+    r=simulate_mkt_partial(df.o.values,df.h.values,df.l.values,df.c.values,sig[o_],f(dirn),f(stop),f(tp_abs),df['flat_rth'].values,float(t1),float(frac1),bool(be),TICK,COMM)
+    T=pd.DataFrame(r,columns=['ei','xi','fill','R','pnl','si','dir','maeR','mfeR','bars'])
+    for kk in ['ei','xi','si']: T[kk]=T[kk].astype(int)
+    T['code']=-1
+    T['ts']=df.ts.values[T.ei.values]; T['sd']=df.sd.values[T.ei.values]; T['win']=T.pnl>0; T['pnlR']=T.pnl/T.R
+    return T
