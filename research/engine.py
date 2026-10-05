@@ -267,3 +267,99 @@ def run_oco(df,sig,pxL,slL,pxS,slS,expiry=None,rr=1e6,max_bars=0,flat=None,slip_
     T['ts']=df.ts.values[T.ei.values]; T['sd']=df.sd.values[T.ei.values]
     T['win']=T.pnl>0; T['pnlR']=T.pnl/T.R
     return T
+
+@nb.njit(cache=True)
+def simulate_oco2(o,h,l,c,sig,pxL,slL,pxS,slS,expiry,flat,stop_frac,t1,frac1,be,t2,tick,comm,slip_ticks):
+    """OCO stop-entry (same fill/cancel rules as simulate_oco with invalidation) + management:
+    stop placed at fill - d*stop_frac*R0 (R0 = distance fill->structural stop); partial exit of frac1 at t1*R (limit,
+    trade-through 1 tick); after t1 is hit the remaining stop moves to entry+1tick (if be) from the NEXT bar;
+    remainder exits at t2*R (>=1e5: none) or stop or session flat. pnl reported per 1 unit (weighted), R = actual risk."""
+    n=len(sig); out=np.full((n,9),np.nan); busy=-1; k=0; sl=slip_ticks*tick
+    for s in range(n):
+        t=sig[s]
+        if t<=busy: continue
+        j=t+1; d=0.0; fill=np.nan; st0=np.nan; cancelled=False
+        while j<=expiry[s] and j<=flat[t]:
+            lt=(not np.isnan(pxL[s])) and h[j]>=pxL[s]
+            stt=(not np.isnan(pxS[s])) and l[j]<=pxS[s]
+            invL=(not np.isnan(pxL[s])) and l[j]<=slL[s]
+            invS=(not np.isnan(pxS[s])) and h[j]>=slS[s]
+            if (invL and np.isnan(pxS[s])) or (invS and np.isnan(pxL[s])):
+                cancelled=True; break
+            if lt and stt:
+                if abs(o[j]-pxL[s])<=abs(o[j]-pxS[s]): stt=False
+                else: lt=False
+            if lt:
+                d=1.0; fill=max(pxL[s],o[j])+sl; st0=slL[s]; break
+            if stt:
+                d=-1.0; fill=min(pxS[s],o[j])-sl; st0=slS[s]; break
+            j+=1
+        if cancelled:
+            busy=j; continue
+        if d==0.0:
+            busy=min(expiry[s],flat[t]); continue
+        R0=(fill-st0)*d
+        if R0<=tick:
+            busy=j; continue
+        R=stop_frac*R0
+        if R<=2*tick:
+            busy=j; continue
+        cur=fill-d*R; tp1=fill+d*t1*R; tp2=fill+d*t2*R
+        first=j; fe=flat[first]; e=first; part=False; pnl=0.0; rem=1.0; code=-1; mae=0.0; mfe=0.0; pend_be=False
+        while e<=fe:
+            if pend_be:
+                cur=max(cur,fill+tick) if d>0 else min(cur,fill-tick); pend_be=False
+            adv=(fill-l[e]) if d>0 else (h[e]-fill); fav=(h[e]-fill) if d>0 else (fill-l[e])
+            slh=(l[e]<=cur) if d>0 else (h[e]>=cur)
+            h1=(not part) and t1>0 and (((h[e]>=tp1+tick) if d>0 else (l[e]<=tp1-tick)))
+            h2=t2<1e5 and (((h[e]>=tp2+tick) if d>0 else (l[e]<=tp2-tick)))
+            if e==first: h1=False; h2=False
+            if slh:
+                gap=(o[e]<cur) if d>0 else (o[e]>cur)
+                ex=(o[e] if (gap and e!=first) else cur)-d*sl
+                pnl+=rem*(ex-fill)*d; rem=0.0; code=0
+                mae=max(mae,min(adv,R)); break
+            mae=max(mae,adv); mfe=max(mfe,fav)
+            if h1:
+                pnl+=frac1*(tp1-fill)*d; rem-=frac1; part=True
+                if be: pend_be=True
+                if rem<=1e-9: code=1; break
+            if h2:
+                pnl+=rem*(tp2-fill)*d; rem=0.0; code=1; break
+            e+=1
+        if rem>1e-9:
+            if e>fe: e=fe
+            pnl+=rem*(c[e]-d*sl-fill)*d; code=2 if code==-1 else code
+        out[k,0]=first; out[k,1]=e; out[k,2]=fill; out[k,3]=R; out[k,4]=pnl-comm; out[k,5]=code; out[k,6]=t; out[k,7]=d; out[k,8]=mae/R
+        k+=1; busy=e
+    return out[:k]
+
+def run_oco2(df,sig,pxL,slL,pxS,slS,expiry,stop_frac=1.0,t1=0.0,frac1=0.5,be=False,t2=1e6,flat=None,slip_ticks=1):
+    sig=np.asarray(sig,np.int64)
+    if flat is None: flat=df['flat_rth'].values
+    order=np.argsort(sig,kind='stable'); f=lambda x: np.asarray(x,np.float64)[order]
+    r=simulate_oco2(df.o.values,df.h.values,df.l.values,df.c.values,sig[order],f(pxL),f(slL),f(pxS),f(slS),
+                    np.asarray(expiry,np.int64)[order],np.asarray(flat,np.int64),float(stop_frac),float(t1),float(frac1),bool(be),float(t2),TICK,COMM,int(slip_ticks))
+    T=pd.DataFrame(r,columns=['ei','xi','fill','R','pnl','code','si','dir','maeR'])
+    for kk in ['ei','xi','code','si']: T[kk]=T[kk].astype(int)
+    T['ts']=df.ts.values[T.ei.values]; T['sd']=df.sd.values[T.ei.values]
+    T['win']=T.pnl>0; T['pnlR']=T.pnl/T.R
+    return T
+
+def streak_stats(T):
+    w=T.win.values; s=0; st=[]
+    for v in w:
+        if not v: s+=1
+        else:
+            if s: st.append(s)
+            s=0
+    if s: st.append(s)
+    st=np.array(st) if st else np.array([0])
+    eq=np.cumsum(T.pnlR.values); dd=np.maximum.accumulate(eq)-eq
+    # average drawdown depth over drawdown episodes
+    ep=[]; cur=0
+    for x in dd:
+        if x>0: cur=max(cur,x)
+        elif cur>0: ep.append(cur); cur=0
+    if cur>0: ep.append(cur)
+    return dict(avgLS=round(st.mean(),2),maxLS=int(st.max()),p90LS=int(np.quantile(st,0.9)),avgDD=round(np.mean(ep) if ep else 0,2),maxDD=round(dd.max(),1))
