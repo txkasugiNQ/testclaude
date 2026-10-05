@@ -1,0 +1,10 @@
+{
+  "registered": "2026-10-05, after IS (2023-01..2024-06) / VAL (2024-07..12) analysis only; 2025 London data never evaluated",
+  "session": "London 08:00-12:00 Europe/London (DST-correct); entries 08:00-11:56; flat 12:00 London",
+  "LOM": {"name": "London Open Momentum", "signal_tf": 2, "decision_bar_close": "08:16 London",
+          "condition": "|close - 08:00 open| >= 2.0 x ATR14(2m)", "entry": "market, next 1m open, in direction of the move",
+          "stop": "1.5 x ATR14(2m) from signal close", "variants_tp_R": [0.5, 1.0, 1.5], "max_trades_per_day": 1},
+  "LER": {"name": "London Early-move Reversion", "signal_tf": 2, "decision_bar_close": "09:30 London",
+          "condition": "|close - 08:00 open| >= 3.0 x ATR14(2m)", "entry": "market, next 1m open, AGAINST the move",
+          "stop": "beyond running London-session extreme on the move side + 1 tick", "target": "08:00 London open price", "max_trades_per_day": 1}
+}

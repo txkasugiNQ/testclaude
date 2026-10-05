@@ -2,3 +2,4 @@ research/*.pkl
 research/*.txt
 research/charts/
 __pycache__/
+research/ldn_charts/
