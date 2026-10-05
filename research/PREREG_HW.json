@@ -1,0 +1,14 @@
+{
+  "name": "NQ PM late-session VWAP 2.5-sigma rejection fade (VWR) — high-winrate study",
+  "registered": "2026-10-05, after IS/VAL analysis only; 2025 not yet evaluated for this family",
+  "rules": {
+    "signal_tf_min": 2, "execution": "1m bars, conservative intrabar rules",
+    "band": "RTH VWAP +/- 2.5 x volume-weighted stdev of typical price since 09:30",
+    "trigger": "first 2m bar of the day (edge-triggered) whose high >= upper band but close < upper band -> SHORT; mirror for lower band -> LONG",
+    "entry": "market at the open of the next 1m bar", "entry_window_ET": "14:00-15:56", "flat": "16:00 bar close",
+    "stop": "rejection-bar extreme +/- 1 tick (structural); trade skipped if stop < 0.5 ATR or > 4 ATR (2m ATR14)",
+    "max_trades_per_day": 3
+  },
+  "variants": {"VWR-0.5R": {"tp_R": 0.5}, "VWR-1R": {"tp_R": 1.0}},
+  "note": "IS/VAL expectancy already below +0.35R; OOS run is documentation of robustness/tail risk, not a candidate for the hard requirement"
+}

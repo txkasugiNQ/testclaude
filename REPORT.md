@@ -3,6 +3,8 @@
 **Bottom line: no strategy was found that meets the hard requirement of ≥ +0.35R per trade on genuinely unseen data.**
 The strongest candidate, **Trend‑Day Breakout (TDB)**, made +0.68R/trade on 2023‑01 → 2024‑12. It was pre‑registered and then tested once on the untouched 2025 holdout, where it made **−0.27R/trade**. The walk‑forward agrees: re‑optimising every quarter still gives −0.16R/trade in 2025. Under your own rule ("IS +0.60R / OOS +0.12R → FAIL"), TDB **fails**, and I'm not presenting it as successful.
 
+**Second study (§9): the high‑win‑rate / low‑RR side was searched separately and deliberately.** The verdict is the same. No setup with a high win rate and small targets reaches +0.35R even in‑sample, and the best pre‑registered high‑win‑rate variant lost money on the 2025 holdout.
+
 The rest of this report documents the full research process. It also gives the complete required metrics for the strongest candidate, its exact rules, the Pine implementation (for visual inspection and forward paper‑testing only), and what would be needed to continue credibly.
 
 ---
@@ -190,3 +192,94 @@ Every exit fails on 2025, which confirms that the *entry* edge disappeared rathe
 - **TradingView Strategy Tester caveat.** TradingView's broker emulator also receives orders. In rare bars where SL and TP (or the entry and SL) fall inside the same 1‑minute bar, it may resolve the order of events differently from the research's worst‑case assumption. The on‑chart table uses the research rules exactly. Enable *Bar Magnifier* if available.
 - **Data differences vs this dataset.** Use NQ1! with back‑adjustment enabled to match the price levels. Roll dates may differ slightly, which can change the 50‑day trend sign around rolls. Half‑day sessions are excluded in the research but not automatically in Pine.
 - **Not compiled here.** No TradingView compiler was available in this environment, so the script has not been compiled or run. Verify parity against `results/tdb_trades_python_reference.csv` on a few dates before relying on it.
+
+## 9. Second study — high‑win‑rate / low‑RR search
+
+**Question:** is there a high‑win‑rate, low‑RR (or asymmetric) NQ NY‑PM setup with expectancy ≥ +0.35R/trade that survives OOS/WF?
+**Answer: no.** The details follow.
+
+### 9.1 The arithmetic that frames the search
+With losses at −1R, the win rate needed for +0.35R, compared with the win rate a pure random walk gives for free:
+
+| Avg win | Win rate needed for +0.35R | Random‑walk win rate (no edge) | Edge needed over random |
+|---|---|---|---|
+| 0.25R | impossible (max +0.25R) | 80% | — |
+| 0.33R | impossible (max +0.33R) | 75% | — |
+| 0.50R | 90% | 67% | +23 pts |
+| 0.67R | 81% | 60% | +21 pts |
+| 0.75R | 77% | 57% | +20 pts |
+| 1.00R | 67.5% | 50% | +17.5 pts |
+
+A high win rate with small targets is therefore **automatic and worthless by itself**. What matters is the excess over the random‑walk win rate. The only other route is cutting losers below −1R with time or level exits, so that expectancy rises at a lower win rate. Both routes were tested.
+
+### 9.2 What was tested (discovery on IS, selection on VAL, 2025 masked)
+- **Edge surface** (`research/hw_lab.py`, `hw_families.py`). For every event, the 1m path was walked forward for every combination of target {0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.5}R × stop {0.75, 1, 1.5, 2} ATR or **structural** (beyond the extreme of the move or rejection bar) × hold {5, 10, 20, 40 min, to 16:00}. This was done on **1m, 2m and 3m** signal bars, about **25,000 cells**. A random‑entry calibration reproduces the random‑walk win rate exactly, with expectancy about 0 to −0.01R.
+- **Families:**
+  1. **impulse exhaustion fade** (3/5/10‑bar moves of ≥2/3/4 ATR), with and without a reversal‑candle confirmation;
+  2. **consecutive‑bar exhaustion** (4–6 bars);
+  3. **VWAP σ‑band fades** (2/2.5/3σ, on touch or rejection);
+  4. **range‑extension fades** beyond AM/IB/ON/PD highs and lows by 0.5/1/2 ATR;
+  5. **failed breakouts** of the session extreme (back inside within 1–3 bars);
+  6. **sweep & reclaim** of 8 key levels;
+  7. **trend‑day pullbacks** with small targets;
+  8. **range‑day new‑extreme fades** and all‑day new‑extreme fades;
+  9. **single‑bar spike** fade and follow;
+  10. on 1m, the same families as **microstructure** reversion.
+- **Level‑target tests** (`hw_magnet.py`):
+  - **magnets:** price near an untouched VWAP / PDC / RTH open / 12:00 price / round 100 / AM POC / day mid, traded *toward* it with target = touch;
+  - **retests:** price beyond a broken level, traded back to it with target = the level;
+  - **VWAP‑band fades** with the target at the 2σ/1.5σ/1σ band or at VWAP itself.
+- **Deep‑dive** of the best family (`hw_vwb.py`, `hw_late.py`, `hw_late2.py`): MAE‑based stop sizing, every exit type, band level, time windows.
+
+### 9.3 Results
+- **No cell reached +0.25R in both IS and VAL** on any timeframe.
+- **Among cells with ≥70% win rate in both periods, the best expectancy was +0.075R** (2m), +0.06R (1m) and +0.03R (3m).
+- Magnets: median edge over the random walk −0.1 / −0.8 percentage points (IS/VAL); best +3.5 pts, worth about +0.05R. Retests: median −1.3 / +0.7 pts; best +3 pts.
+- **The edge shrinks as the target shrinks.** For the best family (VWAP 2.5σ rejection, structural stop, IS), the excess win rate over random is:
+
+  | Target | Excess over random |
+  |---|---|
+  | 0.25R | −2.6 pts |
+  | 0.5R | +1.8 pts |
+  | 1R | +7.9 pts |
+  | 1.5R | +4.4 pts |
+
+  Whatever reversion exists is a slow drift that shows only over larger excursions. **No "small, fast, highly repeatable" move exists that small targets could harvest.**
+- **MAE / stop sizing.** For VWAP‑band fades, eventual winners have a median adverse excursion of 0.46 ATR before +0.5 ATR, but a p90 of 2.2 ATR and a p95 of 3.9 ATR. There is no sharp invalidation point: tighter ATR stops (0.5–0.75 ATR) cut winners as often as losers, and wider ones (2–3 ATR) dilute R. The structural stop (rejection‑bar extreme ± 1 tick, about 13–17 pts ≈ 1 ATR) was best.
+- **Exits for the best family** (structural stop, 12:00–16:00):
+
+  | Exit | IS | VAL | Win rate (IS / VAL) |
+  |---|---|---|---|
+  | Fixed TP 0.25R | −0.01R | −0.05R | 79% / 76% |
+  | Fixed TP 0.5R | +0.07R | +0.11R | 71% / 74% |
+  | Fixed TP 1R | +0.16R | +0.37R | 57% / 68% |
+  | Partial 50% at 0.5R + breakeven runner | −0.06R | +0.39R | — |
+  | Runner to VWAP | +0.01R | +0.45R | — |
+  | Trail after +0.5R | +0.08 to +0.10R | — | — |
+  | Exit at VWAP / 1σ band | −0.02 to +0.02R | +0.86R | — |
+  | Time exits (6–20 min) | ≤ +0.18R | — | — |
+
+- **Late‑session lead.** Entries 14:00–16:00 looked better (1R target: IS +0.24R / VAL +0.46R, 64% win rate), but only at exactly 2.5σ. In IS, 2.45σ gives +0.17R and 2.55σ +0.05R, so that peak is noise; the neighbourhood is about +0.1R.
+
+### 9.4 Pre‑registered high‑win‑rate variants (`research/PREREG_HW.json`), 2025 evaluated once
+**VWR: late‑session (14:00–15:56) VWAP 2.5σ rejection fade.** Market entry on the next 1m bar, structural stop (average 16.9 pts), max 3 trades/day. Compared side by side with the high‑RR candidates:
+
+| Strategy | Expectancy 2023 / 2024 / **2025** | Win rate 2023 / 2024 / 2025 | 3‑yr expectancy | 3‑yr PF | Max DD | Max losing streak | Avg stop |
+|---|---|---|---|---|---|---|---|
+| VWR‑0.5R (high win rate) | +0.08 / +0.14 / **−0.18** | 72% / 76% / 54% | +0.04R | 1.12 | 6.4R | 4 | 16.9 pts |
+| VWR‑1R (1:1) | +0.14 / +0.42 / **−0.14** | 56% / 71% / 42% | +0.18R | 1.43 | 7.9R | 7 | 16.9 pts |
+| TDB v1.0 (high RR, §3) | +0.66 / +0.70 / **−0.27** | 34% / 36% / 15% | +0.34R | 1.47 | 31.6R | 19 | 19.1 pts |
+| TDC* (trend‑day continuation, market entry, 3m, stop 1.5 ATR, trail 2R/1R) | +0.27 / +0.64 / +0.20 | 44% / 48% / 46% | +0.37R | 1.69 | 16.2R | 8 | 31.2 pts |
+
+\*TDC was chosen by looking at all three years (it answers "what is best over 2023–2025 combined"), so its 2025 figure is **in‑sample, not OOS**. It is also positive in every year only with a wide ~31‑pt stop, and 2025 alone is below +0.35R.
+
+- **Walk‑forward for the VWR family** (quarterly re‑optimisation over band 2.4/2.5/2.6σ × start 13:30/14:00/14:30 × target 0.5/0.75/1R): 2023 −0.31R, 2024 +0.25R, 2025 −0.21R; all test quarters **−0.005R**, 51% win rate.
+- **Tail risk** (`results/hw_tailrisk_*.csv`). In this 1m data, every loss in every strategy is exactly −1R: the largest loss and the p95/p99 losses all equal 1R, with no gap through a stop. So the low‑RR tail risk here is not single catastrophic losses but **clustering**. For VWR‑0.5R the 2025 equity stayed underwater for the whole year (26 of 26 trades). Over three years, dropping the 5 worst VWR‑0.5R trades lifts expectancy only from +0.04R to +0.09R, and dropping the 5 best turns it to +0.01R. The profitability is neither stable nor large. Real fills on fast news minutes (14:00 FOMC) would add losses beyond −1R that 1m bars cannot show.
+- **Data limit.** With stops of 0.5 ATR (about 7 pts) and targets of 0.25–0.33R (2–3 pts), the target and stop often fall in the same 1m bar. The worst‑case rule then costs about 0.1R, so those cells cannot be judged honestly without tick data. Larger, testable versions show no edge.
+
+### 9.5 Conclusion of the second study
+Searching both sides of the distribution gives the same answer. On both sides, NQ NY‑PM win rates sit at the random‑walk value plus a few points:
+- **High‑win‑rate / low‑RR:** the best robust result is +0.04 to +0.08R at a 70–76% win rate, and it failed in 2025.
+- **Low‑win‑rate / high‑RR:** TDB reached +0.66–0.70R in 2023–24, then failed in 2025.
+
+The edge that does exist is a slow, regime‑dependent drift. It needs larger targets to show at all, and it reversed in 2025 for both momentum (breakouts) and reversion (VWAP‑band fades). **No high‑win‑rate setup with ≥ +0.35R expectancy survived OOS/WF, and none reached it even in‑sample.**
