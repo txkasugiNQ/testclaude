@@ -1,0 +1,4 @@
+research/*.pkl
+research/*.txt
+research/charts/
+__pycache__/

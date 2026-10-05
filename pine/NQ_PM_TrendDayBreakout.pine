@@ -1,0 +1,330 @@
+//@version=6
+// =====================================================================================================
+//  NQ PM Trend-Day Breakout (TDB) v1.0  —  RESEARCH BUILD
+//  -----------------------------------------------------------------------------------------------------
+//  !!! STATUS: FAILED the pre-registered 2025 out-of-sample test (OOS expectancy -0.27R/trade).
+//  !!! This script is provided for visual inspection, rule verification and FORWARD (paper) testing only.
+//  !!! It does NOT satisfy the +0.35R out-of-sample requirement. Do not trade it live on this evidence.
+//  -----------------------------------------------------------------------------------------------------
+//  RUN ON A 1-MINUTE NQ CHART (e.g. CME_MINI:NQ1!). Signal bars (1/2/3 min) are aggregated internally,
+//  aligned to the 18:00 ET Globex open, exactly like the Python research engine. All entries/exits are
+//  evaluated on 1-minute bars with the same conservative rules as the research backtest:
+//    * entry stop fills when 1m high >= stop (long) at max(stop, open)
+//    * fill bar: stop-loss counts as hit if the fill bar's low <= SL (worst case); TP only if the fill bar CLOSES beyond TP
+//    * later bars: gap through SL -> exit at open; SL and TP in same bar -> SL
+//    * flat at the 16:00 ET bar close
+//  Daily context (50-day trend, 10-day RTH ADR) is computed from 30-minute bars restricted to 09:30-16:00 ET,
+//  using PRIOR sessions only (constant during the day -> non-repainting). No future pivots, no lookahead.
+// =====================================================================================================
+strategy("NQ PM Trend-Day Breakout (TDB) — research build (FAILED 2025 OOS)", shorttitle="TDB research", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=100, initial_capital=100000,
+     default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.25, slippage=2, process_orders_on_close=true, calc_on_every_tick=false)
+
+// ---------------- inputs ----------------
+grpS = "Signal"
+sigTF      = input.int(2, "Signal timeframe (minutes, built from 1m chart)", options=[1, 2, 3], group=grpS)
+atrLen     = input.int(14, "ATR length (signal bars, Wilder)", minval=1, group=grpS)
+stopATR    = input.float(1.25, "Stop distance (x ATR of signal TF)", step=0.05, group=grpS)
+tpR        = input.float(4.0, "Take profit (R multiple, 0 = none)", step=0.25, group=grpS)
+tdMin      = input.float(0.40, "Trend-day filter: |price - RTH open| >= x * ADR", step=0.05, group=grpS)
+adrLen     = input.int(10, "ADR length (prior RTH sessions)", minval=5, group=grpS)
+maLen      = input.int(50, "Daily trend: prior RTH close vs SMA(n) of RTH closes", minval=2, group=grpS)
+maxTrades  = input.int(2, "Max trades per day", minval=1, group=grpS)
+allowLong  = input.bool(true, "Allow longs", group=grpS)
+allowShort = input.bool(true, "Allow shorts", group=grpS)
+grpT = "Session (New York time, bar-CLOSE minutes)"
+setupStart = input.int(12 * 60, "Setup window start (minutes after 00:00 ET)", group=grpT, tooltip="720 = 12:00. A signal bar closing at 12:00 can arm an order that fills from 12:00 onward.")
+setupEnd   = input.int(14 * 60, "Setup window end (last signal-bar close)", group=grpT, tooltip="840 = 14:00")
+flatMin    = input.int(16 * 60, "Flat at (bar close)", group=grpT, tooltip="960 = 16:00")
+grpV = "Visuals"
+showSetup  = input.bool(true, "Show setup / preparation (levels, trend-day zone)", group=grpV)
+showOrders = input.bool(true, "Show pending entry stop", group=grpV)
+showTable  = input.bool(true, "Show research-rule statistics table", group=grpV)
+
+if timeframe.period != "1"
+    runtime.error("TDB: run this script on a 1-minute chart (signal bars are built internally).")
+
+// ---------------- time helpers (NY time, DST-aware) ----------------
+f_min(t) => hour(t, "America/New_York") * 60 + minute(t, "America/New_York")
+todC   = f_min(time_close)          // minutes of this 1m bar's CLOSE (research 'tod')
+todO   = f_min(time)                // minutes of this 1m bar's OPEN
+newDay = timeframe.change("1D")     // CME trading day boundary (18:00 ET)
+
+// ---------------- daily context from 30-minute RTH bars (prior sessions only) ----------------
+f_ctx() =>
+    var array<float> closes = array.new<float>()
+    var array<float> ranges = array.new<float>()
+    var float dh = na
+    var float dl = na
+    var float dc = na
+    var bool  full = false
+    int m = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")    // 30m bar OPEN minute
+    if timeframe.change("1D")
+        if not na(dc) and full
+            closes.push(dc)
+            ranges.push(dh - dl)
+        dh := na
+        dl := na
+        dc := na
+        full := false
+    if m >= 570 and m < 960
+        dh := na(dh) ? high : math.max(dh, high)
+        dl := na(dl) ? low : math.min(dl, low)
+        dc := close
+        if m == 930
+            full := true                   // session has a 15:30-16:00 bar (excludes early-close days)
+    float reg = na
+    int nC = closes.size()
+    if nC >= maLen
+        float s = 0.0
+        for k = nC - maLen to nC - 1
+            s += closes.get(k)
+        reg := math.sign(closes.get(nC - 1) - s / maLen)
+    float adr = na
+    int nR = ranges.size()
+    if nR >= 5
+        int n0 = math.max(0, nR - adrLen)
+        float s2 = 0.0
+        for k = n0 to nR - 1
+            s2 += ranges.get(k)
+        adr := s2 / (nR - n0)
+    [reg, adr]
+[dReg, dADR] = request.security(syminfo.tickerid, "30", f_ctx(), lookahead=barmerge.lookahead_off)
+
+// ---------------- state ----------------
+var float rthOpen = na
+var float rthH = na
+var float rthL = na
+var int   tradesToday = 0
+// signal-bar aggregation
+var int   bk = na
+var float tfH = na
+var float tfL = na
+var float tfPrevC = na
+var float tfATR = na
+// pending order
+var int   pend = 0
+var float pLim = na
+var float pSL = na
+// position
+var int   pos = 0
+var float ePx = na
+var float sl = na
+var float tp = na
+var float R = na
+var int   eBar = na
+var line  lnE = na
+var line  lnS = na
+var line  lnT = na
+// research-rule statistics: [trades, wins, sumR, grossWinR, grossLossR]
+var array<float> st = array.from(0.0, 0.0, 0.0, 0.0, 0.0)
+
+if newDay
+    rthOpen := na
+    rthH := na
+    rthL := na
+    tradesToday := 0
+    pend := 0
+
+// signal-bar aggregation (bucket = floor((close minute - 1) / tf), aligned to 18:00 ET)
+int b = math.floor((todC - 1) / sigTF)
+if na(bk) or b != bk or newDay
+    bk := b
+    tfH := high
+    tfL := low
+else
+    tfH := math.max(tfH, high)
+    tfL := math.min(tfL, low)
+bool tfClose = todC % sigTF == 0
+
+// RTH bar of the current trading day: closes 09:31..17:00 ET (overnight bars after 18:00 are NOT RTH)
+bool rthBar = todC > 570 and todC <= 1020
+if rthBar and na(rthOpen)
+    rthOpen := open
+
+// ---------------- helper: log a closed trade ----------------
+f_close(float xpx, string why) =>
+    float r = (xpx - ePx) * pos / R
+    st.set(0, st.get(0) + 1)
+    st.set(2, st.get(2) + r)
+    if r > 0
+        st.set(1, st.get(1) + 1)
+        st.set(3, st.get(3) + r)
+    else
+        st.set(4, st.get(4) - r)
+    line.set_x2(lnE, bar_index)
+    line.set_x2(lnS, bar_index)
+    line.set_x2(lnT, bar_index)
+    label.new(bar_index, xpx, why + " " + str.tostring(r, "#.##") + "R", style=label.style_label_left,
+         color=r > 0 ? color.new(color.green, 20) : color.new(color.red, 20), textcolor=color.white, size=size.small)
+    r
+
+// ================= 1) manage open position on this 1m bar =================
+bool exitedNow = false
+if pos != 0
+    float xpx = na
+    string why = ""
+    if pos > 0
+        if open <= sl
+            xpx := open
+            why := "SL(gap)"
+        else if low <= sl
+            xpx := sl
+            why := "SL"
+        else if tpR > 0 and high >= tp
+            xpx := tp
+            why := "TP"
+    else
+        if open >= sl
+            xpx := open
+            why := "SL(gap)"
+        else if high >= sl
+            xpx := sl
+            why := "SL"
+        else if tpR > 0 and low <= tp
+            xpx := tp
+            why := "TP"
+    if na(xpx) and todC >= flatMin
+        xpx := close
+        why := "Time"
+    if not na(xpx)
+        f_close(xpx, why)
+        pos := 0
+        exitedNow := true
+        strategy.close_all(comment=why)
+
+// ================= 2) pending entry stop on this 1m bar =================
+else if pend != 0
+    bool cancelled = (todO >= setupEnd + sigTF) or (todC > flatMin)
+    bool filled = false
+    float fpx = na
+    if not cancelled
+        if pend > 0 and high >= pLim
+            filled := true
+            fpx := math.max(pLim, open)
+        else if pend < 0 and low <= pLim
+            filled := true
+            fpx := math.min(pLim, open)
+    if filled
+        pos := pend
+        ePx := fpx
+        sl := pSL
+        R := math.abs(ePx - sl)
+        tp := ePx + pos * tpR * R
+        eBar := bar_index
+        tradesToday += 1
+        pend := 0
+        lnE := line.new(bar_index, ePx, bar_index, ePx, color=color.blue, width=2)
+        lnS := line.new(bar_index, sl, bar_index, sl, color=color.red, width=2)
+        lnT := line.new(bar_index, tpR > 0 ? tp : ePx, bar_index, tpR > 0 ? tp : ePx, color=color.green, width=2, style=tpR > 0 ? line.style_solid : line.style_dotted)
+        label.new(bar_index, ePx, (pos > 0 ? "BUY " : "SELL ") + str.tostring(ePx, format.mintick) + "\nSL " + str.tostring(sl, format.mintick) + "\nTP " + str.tostring(tp, format.mintick),
+             style=pos > 0 ? label.style_label_up : label.style_label_down, yloc=pos > 0 ? yloc.belowbar : yloc.abovebar,
+             color=pos > 0 ? color.new(color.teal, 0) : color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+        // conservative same-bar evaluation (identical to research engine)
+        float x2 = na
+        string w2 = ""
+        if pos > 0
+            if low <= sl
+                x2 := sl
+                w2 := "SL"
+            else if tpR > 0 and close >= tp
+                x2 := tp
+                w2 := "TP"
+        else
+            if high >= sl
+                x2 := sl
+                w2 := "SL"
+            else if tpR > 0 and close <= tp
+                x2 := tp
+                w2 := "TP"
+        if na(x2) and todC >= flatMin
+            x2 := close
+            w2 := "Time"
+        if not na(x2)
+            f_close(x2, w2)
+            pos := 0
+            exitedNow := true
+            strategy.close_all(comment=w2)
+    else if cancelled
+        pend := 0
+
+// ================= 3) signal-bar close: ATR, session extremes, setup =================
+bool setupActive = false
+float trigLvl = na
+if tfClose
+    float tr = na(tfPrevC) ? tfH - tfL : math.max(tfH - tfL, math.abs(tfH - tfPrevC), math.abs(tfL - tfPrevC))
+    tfATR := na(tfATR) ? tr : tfATR + (tr - tfATR) / atrLen
+    tfPrevC := close
+    if pend != 0
+        pend := 0                                   // order lives exactly one signal bar
+        strategy.cancel("TDB L")
+        strategy.cancel("TDB S")
+    if rthBar
+        rthH := na(rthH) ? tfH : math.max(rthH, tfH)
+        rthL := na(rthL) ? tfL : math.min(rthL, tfL)
+    if pos == 0 and tradesToday < maxTrades and todC >= setupStart and todC <= setupEnd and not na(dADR) and not na(rthOpen) and not na(dReg)
+        for sd in array.from(1, -1)
+            bool okTD   = (close - rthOpen) * sd >= tdMin * dADR
+            bool okReg  = sd > 0 ? (allowLong and dReg > 0) : (allowShort and dReg < 0)
+            if okTD and okReg and pend == 0
+                float lim = (sd > 0 ? rthH : rthL) + sd * syminfo.mintick
+                float stp = lim - sd * stopATR * tfATR
+                pend := sd
+                pLim := lim
+                pSL := stp
+                setupActive := true
+                trigLvl := lim
+                float riskTicks = math.abs(lim - stp) / syminfo.mintick
+                if sd > 0
+                    strategy.entry("TDB L", strategy.long, stop=lim, comment="TDB L")
+                    strategy.exit("XL", "TDB L", stop=stp, profit=tpR > 0 ? tpR * riskTicks : na)
+                else
+                    strategy.entry("TDB S", strategy.short, stop=lim, comment="TDB S")
+                    strategy.exit("XS", "TDB S", stop=stp, profit=tpR > 0 ? tpR * riskTicks : na)
+
+// ---------------- visuals: setup / preparation ----------------
+bool inPM = todC > setupStart - sigTF and todC <= flatMin
+float tdUp = not na(rthOpen) and not na(dADR) ? rthOpen + tdMin * dADR : na
+float tdDn = not na(rthOpen) and not na(dADR) ? rthOpen - tdMin * dADR : na
+plot(showSetup and inPM ? rthOpen : na, "RTH open", color=color.new(color.gray, 30), style=plot.style_linebr)
+plot(showSetup and inPM and dReg > 0 ? tdUp : na, "Trend-day threshold (long)", color=color.new(color.teal, 40), style=plot.style_linebr)
+plot(showSetup and inPM and dReg < 0 ? tdDn : na, "Trend-day threshold (short)", color=color.new(color.maroon, 40), style=plot.style_linebr)
+plot(showSetup and inPM and dReg > 0 ? rthH : na, "Session high (long trigger)", color=color.new(color.green, 0), style=plot.style_stepline)
+plot(showSetup and inPM and dReg < 0 ? rthL : na, "Session low (short trigger)", color=color.new(color.red, 0), style=plot.style_stepline)
+plot(showOrders and pend != 0 ? pLim : na, "Pending entry stop", color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2)
+plot(showOrders and pend != 0 ? pSL : na, "Pending stop-loss", color=color.new(color.red, 50), style=plot.style_circles)
+bgcolor(showSetup and setupActive ? (pend > 0 ? color.new(color.teal, 88) : color.new(color.maroon, 88)) : na, title="Setup armed")
+bgcolor(showSetup and todC > setupStart and todC <= setupEnd + sigTF ? color.new(color.yellow, 96) : na, title="Setup window")
+// extend open trade lines
+if pos != 0 and not exitedNow
+    line.set_x2(lnE, bar_index)
+    line.set_x2(lnS, bar_index)
+    line.set_x2(lnT, bar_index)
+
+// ---------------- table ----------------
+var table tb = table.new(position.top_right, 2, 9, border_width=1)
+if showTable and barstate.islast
+    float nT = st.get(0)
+    float nW = st.get(1)
+    float sumR = st.get(2)
+    float gW = st.get(3)
+    float gL = st.get(4)
+    table.cell(tb, 0, 0, "TDB research rules", text_color=color.white, bgcolor=color.new(color.navy, 0))
+    table.cell(tb, 1, 0, "FAILED 2025 OOS", text_color=color.white, bgcolor=color.new(color.red, 0))
+    table.cell(tb, 0, 1, "Trades")
+    table.cell(tb, 1, 1, str.tostring(nT, "#"))
+    table.cell(tb, 0, 2, "Win rate")
+    table.cell(tb, 1, 2, nT > 0 ? str.tostring(100.0 * nW / nT, "#.#") + "%" : "-")
+    table.cell(tb, 0, 3, "Expectancy (R)")
+    table.cell(tb, 1, 3, nT > 0 ? str.tostring(sumR / nT, "#.###") : "-")
+    table.cell(tb, 0, 4, "Profit factor")
+    table.cell(tb, 1, 4, gL > 0 ? str.tostring(gW / gL, "#.##") : "-")
+    table.cell(tb, 0, 5, "Total R")
+    table.cell(tb, 1, 5, str.tostring(sumR, "#.#"))
+    table.cell(tb, 0, 6, "Daily trend")
+    table.cell(tb, 1, 6, na(dReg) ? "n/a" : dReg > 0 ? "UP (longs only)" : "DOWN (shorts only)")
+    table.cell(tb, 0, 7, "ADR(" + str.tostring(adrLen) + ")")
+    table.cell(tb, 1, 7, na(dADR) ? "n/a" : str.tostring(dADR, "#.0") + " pts")
+    table.cell(tb, 0, 8, "Signal TF / stop")
+    table.cell(tb, 1, 8, str.tostring(sigTF) + "m / " + str.tostring(stopATR) + "xATR")

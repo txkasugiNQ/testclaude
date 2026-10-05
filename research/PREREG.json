@@ -1,0 +1,14 @@
+{
+  "name": "NQ PM Trend-Day Breakout (TDB) v1.0",
+  "registered_utc": "2026-10-05 (before any OOS-2025 evaluation of this family)",
+  "selection_basis": "plateau centre on IS(2023-01..2024-06)+VAL(2024-07..2024-12); neighbourhood-median rule; OOS 2025 untouched",
+  "params": {
+    "tf": 2, "atr_len": 14, "reg_kind": "ma", "reg_w": 50,
+    "td_min": 0.4, "adr_n": 10,
+    "brk_start": 720, "brk_end": 840, "ent_end": 842, "flat_tod": 960,
+    "entry_mode": 1, "wait_bars": 1, "s_stop": 1.25, "stop_mode": 0,
+    "tp_R": 4.0, "max_trades": 2
+  },
+  "alternatives_reported_not_selected": ["TP3", "trail start 3R dist 1.5R", "trail 3R/2R", "partial 2R x50% + TP4", "hold to 16:00"],
+  "cost_model": {"entry_stop_slip_pts": 0.5, "stop_exit_slip_pts": 0.5, "tp_limit_slip_pts": 0.0, "time_exit_slip_pts": 0.25, "commission_rt_pts": 0.25}
+}
