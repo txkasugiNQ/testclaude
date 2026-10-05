@@ -1,0 +1,1059 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  NQ STRUCTURE LEVELS — Tops/Bottoms · Ranges · High-Confluence Zones
+//  Built for NQ / MNQ / NAS100 intraday (1m, 2m, 5m, 15m, 30m).
+//
+//  Anti-repaint design:
+//   • Every structural level is created only on a CONFIRMED (closed) bar,
+//     after its full confirmation requirement has passed.
+//   • Higher-timeframe data uses [1] + lookahead_on = last CLOSED HTF bar only.
+//   • Session / day / week levels are finalized only after the period ends.
+//   • Developing (unconfirmed) items are dotted and tagged "dev".
+// ════════════════════════════════════════════════════════════════════════════
+indicator("NQ Structure Levels", shorttitle = "NQ Levels", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200, max_bars_back = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+const string G_GEN = "GENERAL"
+const string G_TOL = "TOLERANCE / MERGING"
+const string G_SW  = "SWING DETECTION"
+const string G_RG  = "RANGE DETECTION"
+const string G_BH  = "TOUCH / BREAKOUT / RETEST"
+const string G_CF  = "CONFLUENCE"
+const string G_MTF = "MULTI-TIMEFRAME"
+const string G_SS  = "SESSIONS & KEY LEVELS"
+const string G_VIS = "VISUALS"
+const string G_COL = "COLORS"
+const string G_AL  = "ALERTS"
+
+// ── GENERAL
+bool   iEnable      = input.bool(true, "Enable indicator", group = G_GEN)
+int    iHistDays    = input.int(5, "Historical trading days", minval = 1, maxval = 20, group = G_GEN, tooltip = "A level is removed after this many trading days without any reaction (hard cap: 2x this value since creation).")
+int    iMaxLevels   = input.int(50, "Maximum stored levels", minval = 10, maxval = 150, group = G_GEN)
+int    iMaxVisible  = input.int(20, "Maximum visible levels", minval = 1, maxval = 60, group = G_GEN)
+float  iMinStrength = input.float(2.5, "Minimum strength to display", minval = 0.0, step = 0.5, group = G_GEN)
+int    iAtrLen      = input.int(21, "ATR length", minval = 5, maxval = 200, group = G_GEN)
+float  iDecay       = input.float(0.85, "Strength decay per quiet trading day", minval = 0.5, maxval = 1.0, step = 0.05, group = G_GEN, tooltip = "Strength = confluence x decay^(trading days since last reaction). 1.0 = no decay.")
+string iTZ          = input.string("America/New_York", "Session timezone", group = G_GEN)
+
+// ── TOLERANCE / MERGING
+string iTolMethod   = input.string("ATR", "Merge tolerance method", options = ["ATR", "Ticks", "Percent"], group = G_TOL)
+float  iTolATR      = input.float(0.25, "ATR multiple", minval = 0.02, step = 0.05, group = G_TOL)
+int    iTolTicks    = input.int(16, "Ticks (NQ tick = 0.25)", minval = 1, group = G_TOL)
+float  iTolPct      = input.float(0.02, "Percent of price", minval = 0.001, step = 0.005, group = G_TOL)
+float  iEqFactor    = input.float(0.5, "Equal high/low tolerance (x merge tol)", minval = 0.1, maxval = 1.0, step = 0.1, group = G_TOL)
+float  iTouchFactor = input.float(0.5, "Touch tolerance (x merge tol)", minval = 0.1, maxval = 2.0, step = 0.1, group = G_TOL)
+float  iBreakATR    = input.float(0.15, "Break buffer (ATR)", minval = 0.0, step = 0.05, group = G_TOL, tooltip = "A bar must CLOSE beyond the zone by this much to count as a break.")
+
+// ── SWING DETECTION
+int    iSwLen   = input.int(5, "Swing sensitivity (bars each side)", minval = 2, maxval = 30, group = G_SW)
+int    iMajLen  = input.int(15, "Major swing bars each side", minval = 5, maxval = 60, group = G_SW)
+float  iMinProm = input.float(1.0, "Min swing prominence (ATR)", minval = 0.0, step = 0.1, group = G_SW)
+float  iMinLeg  = input.float(1.5, "Min swing-to-swing distance (ATR)", minval = 0.0, step = 0.1, group = G_SW)
+float  iMajProm = input.float(3.0, "Major swing prominence (ATR)", minval = 0.5, step = 0.25, group = G_SW)
+int    iMinBars = input.int(5, "Min bars between same-side pivots", minval = 1, group = G_SW)
+float  iDispATR = input.float(1.5, "Displacement away from pivot (ATR)", minval = 0.0, step = 0.1, group = G_SW)
+bool   iReqVol  = input.bool(false, "Require volume confirmation", group = G_SW, tooltip = "Ignored automatically when the symbol has no volume data.")
+float  iVolMult = input.float(1.5, "Volume spike multiple", minval = 1.0, step = 0.1, group = G_SW)
+int    iVolLen  = input.int(20, "Volume average length", minval = 5, group = G_SW)
+
+// ── RANGE DETECTION
+bool   iRangeOn    = input.bool(true, "Detect ranges", group = G_RG)
+int    iRangeLen   = input.int(30, "Range lookback (bars)", minval = 10, maxval = 300, group = G_RG)
+int    iRangeMin   = input.int(40, "Minimum range duration (bars)", minval = 10, maxval = 1000, group = G_RG)
+float  iRangeATR   = input.float(3.0, "Max range width (ATR)", minval = 0.5, step = 0.25, group = G_RG)
+int    iRangeTests = input.int(2, "Min tests per boundary", minval = 1, maxval = 10, group = G_RG)
+bool   iDevRange   = input.bool(true, "Show developing range box + midpoint", group = G_RG)
+
+// ── TOUCH / BREAKOUT / RETEST
+float  iRejATR      = input.float(0.3, "Rejection: close away from zone (ATR)", minval = 0.0, step = 0.05, group = G_BH)
+int    iTouchCool   = input.int(3, "Touch cooldown (bars)", minval = 1, group = G_BH)
+int    iFakeBars    = input.int(6, "False-breakout window (bars)", minval = 1, group = G_BH)
+float  iRetestMove  = input.float(0.75, "Min move away before retest (ATR)", minval = 0.1, step = 0.05, group = G_BH)
+int    iRetestMax   = input.int(60, "Max bars to wait for retest", minval = 5, group = G_BH)
+float  iApproachATR = input.float(0.5, "Approach distance (ATR)", minval = 0.05, step = 0.05, group = G_BH)
+
+// ── CONFLUENCE WEIGHTS
+float wSwing   = input.float(1.0, "Swing", minval = 0.0, step = 0.25, inline = "w1", group = G_CF)
+float wMajor   = input.float(1.5, "Major", minval = 0.0, step = 0.25, inline = "w1", group = G_CF)
+float wRange   = input.float(1.5, "Range", minval = 0.0, step = 0.25, inline = "w2", group = G_CF)
+float wEqual   = input.float(1.5, "Equal H/L", minval = 0.0, step = 0.25, inline = "w2", group = G_CF)
+float wMTF     = input.float(1.0, "MTF", minval = 0.0, step = 0.25, inline = "w3", group = G_CF)
+float wRef     = input.float(1.5, "Key level", minval = 0.0, step = 0.25, inline = "w3", group = G_CF)
+float wTouch   = input.float(0.5, "Touch", minval = 0.0, step = 0.25, inline = "w4", group = G_CF)
+float wReject  = input.float(0.75, "Rejection", minval = 0.0, step = 0.25, inline = "w4", group = G_CF)
+float wRetest  = input.float(1.0, "Retest", minval = 0.0, step = 0.25, inline = "w5", group = G_CF)
+float wFake    = input.float(1.25, "False break", minval = 0.0, step = 0.25, inline = "w5", group = G_CF)
+float wVol     = input.float(0.5, "Volume", minval = 0.0, step = 0.25, inline = "w6", group = G_CF)
+float wDisp    = input.float(1.0, "Displacement", minval = 0.0, step = 0.25, inline = "w6", group = G_CF)
+float wVWAP    = input.float(0.5, "VWAP", minval = 0.0, step = 0.25, inline = "w7", group = G_CF)
+float wChop    = input.float(0.5, "Chop penalty", minval = 0.0, step = 0.25, inline = "w7", group = G_CF)
+float thMod    = input.float(3.0, "Moderate >=", minval = 0.0, step = 0.5, inline = "th", group = G_CF)
+float thStrong = input.float(5.0, "Strong >=", minval = 0.0, step = 0.5, inline = "th", group = G_CF)
+float thHC     = input.float(7.0, "HC >=", minval = 0.0, step = 0.5, inline = "th", group = G_CF)
+
+// ── MULTI-TIMEFRAME
+bool iTf5    = input.bool(true, "5m", inline = "tf", group = G_MTF)
+bool iTf15   = input.bool(true, "15m", inline = "tf", group = G_MTF)
+bool iTf30   = input.bool(false, "30m", inline = "tf", group = G_MTF)
+bool iTf60   = input.bool(true, "1H", inline = "tf", group = G_MTF)
+bool iTf240  = input.bool(true, "4H", inline = "tf", group = G_MTF)
+bool iTfD    = input.bool(true, "Daily", inline = "tf", group = G_MTF)
+int  iHtfLen = input.int(3, "HTF pivot bars each side", minval = 1, maxval = 10, group = G_MTF, tooltip = "Only timeframes HIGHER than the chart are used. Values come from closed HTF bars only.")
+
+// ── SESSIONS & KEY LEVELS
+bool   iPD      = input.bool(true, "Previous day H/L (PDH/PDL)", group = G_SS)
+bool   iPDC     = input.bool(true, "Previous day close (PDC)", group = G_SS)
+bool   iPW      = input.bool(true, "Previous week H/L (PWH/PWL)", group = G_SS)
+bool   iCD      = input.bool(true, "Current day H/L (developing)", group = G_SS)
+bool   iON      = input.bool(true, "Overnight", inline = "on", group = G_SS)
+string iONSess  = input.session("1800-0930", "", inline = "on", group = G_SS)
+bool   iLon     = input.bool(true, "London", inline = "ld", group = G_SS)
+string iLonSess = input.session("0300-0800", "", inline = "ld", group = G_SS)
+bool   iPre     = input.bool(false, "US premarket", inline = "pm", group = G_SS)
+string iPreSess = input.session("0800-0930", "", inline = "pm", group = G_SS)
+bool   iRTH     = input.bool(true, "RTH", inline = "rt", group = G_SS)
+string iRTHSess = input.session("0930-1600", "", inline = "rt", group = G_SS)
+bool   iOR      = input.bool(true, "NY opening range", inline = "or", group = G_SS)
+string iORSess  = input.session("0930-0945", "", inline = "or", group = G_SS)
+bool   iUseVWAP = input.bool(true, "VWAP proximity counts as confluence", group = G_SS)
+
+// ── VISUALS
+bool   iShowWeak    = input.bool(false, "Weak", inline = "r1", group = G_VIS)
+bool   iShowMod     = input.bool(true, "Moderate", inline = "r1", group = G_VIS)
+bool   iShowStrong  = input.bool(true, "Strong", inline = "r1", group = G_VIS)
+bool   iShowHC      = input.bool(true, "High confluence", inline = "r1", group = G_VIS)
+bool   iShowZones   = input.bool(true, "Shade merged zones (strong / HC)", group = G_VIS)
+int    iLineW       = input.int(1, "Base line width", minval = 1, maxval = 4, group = G_VIS)
+int    iHistFade    = input.int(12, "Transparency added per quiet day", minval = 0, maxval = 30, group = G_VIS)
+string iLabelMode   = input.string("Strong+", "Level labels", options = ["None", "HC only", "Strong+", "Moderate+"], group = G_VIS)
+bool   iLabelDetail = input.bool(false, "Detailed labels (type, MTF, FB/RT)", group = G_VIS)
+bool   iLabelPrice  = input.bool(true, "Show price in labels", group = G_VIS)
+int    iLabelOff    = input.int(10, "Level label offset (bars)", minval = 0, maxval = 100, group = G_VIS)
+bool   iKeyLabels   = input.bool(true, "Key level labels (PDH, ONH ...)", group = G_VIS)
+bool   iShowSignals = input.bool(true, "Breakout / retest / false-break markers", group = G_VIS)
+bool   iShowRejects = input.bool(false, "Rejection markers", group = G_VIS)
+bool   iShowMajor   = input.bool(true, "Major top / bottom markers", group = G_VIS)
+bool   iShowTable   = input.bool(true, "Top / Bottom map table", group = G_VIS)
+
+// ── COLORS
+color iColRes   = input.color(#F23645, "Resistance", inline = "c1", group = G_COL)
+color iColSup   = input.color(#089981, "Support", inline = "c1", group = G_COL)
+color iColHC    = input.color(#FF9800, "High confluence", inline = "c1", group = G_COL)
+color iColRange = input.color(#7E57C2, "Range", inline = "c2", group = G_COL)
+color iColKey   = input.color(#2962FF, "Day levels", inline = "c2", group = G_COL)
+color iColWeek  = input.color(#00BCD4, "Week levels", inline = "c2", group = G_COL)
+color iColSess  = input.color(#AB47BC, "Session levels", inline = "c3", group = G_COL)
+color iColDev   = input.color(#787B86, "Developing", inline = "c3", group = G_COL)
+
+// ── ALERTS
+string iAlertClass = input.string("High Confluence", "Min class: approach / touch / rejection", options = ["Moderate", "Strong", "High Confluence"], group = G_AL)
+string iBrkClass   = input.string("Strong", "Min class: breakout / retest / false break", options = ["Moderate", "Strong", "High Confluence"], group = G_AL)
+bool   iAlApproach = input.bool(true, "Approach", inline = "a1", group = G_AL)
+bool   iAlTouch    = input.bool(true, "Touch", inline = "a1", group = G_AL)
+bool   iAlReject   = input.bool(true, "Rejection", inline = "a1", group = G_AL)
+bool   iAlBreak    = input.bool(true, "Breakout", inline = "a2", group = G_AL)
+bool   iAlRetest   = input.bool(true, "Retest", inline = "a2", group = G_AL)
+bool   iAlFake     = input.bool(true, "False break", inline = "a2", group = G_AL)
+bool   iAlMajor    = input.bool(true, "New major top/bottom", inline = "a3", group = G_AL)
+bool   iAlNewHC    = input.bool(true, "New HC level", inline = "a3", group = G_AL)
+bool   iAlertFn    = input.bool(true, "Send detailed alert() messages", group = G_AL, tooltip = "Create the alert with 'Any alert() function call' to receive these. Individual alertcondition() entries are also available.")
+
+// ════════════════════════════════════════════════════════════════════════════
+// CORE SERIES
+// ════════════════════════════════════════════════════════════════════════════
+float atrVal  = ta.atr(iAtrLen)
+float tolBase = switch iTolMethod
+    "Ticks"   => iTolTicks * syminfo.mintick
+    "Percent" => close * iTolPct / 100.0
+    => atrVal * iTolATR
+float mergeTol = math.max(nz(tolBase), 2 * syminfo.mintick)
+float eqTol    = math.max(mergeTol * iEqFactor, syminfo.mintick)
+float touchTol = math.max(mergeTol * iTouchFactor, syminfo.mintick)
+float breakBuf = math.max(iBreakATR * nz(atrVal), syminfo.mintick)
+
+bool  hasVol  = ta.cum(nz(volume)) > 0
+float volAvg  = nz(ta.sma(nz(volume), iVolLen))
+float vwapRaw = ta.vwap(hlc3)
+float vwapVal = hasVol ? vwapRaw : na
+
+// ── Trading day / week (CME day starts 18:00 ET on NQ)
+bool newDay  = timeframe.change("D")
+bool newWeek = timeframe.change("W")
+
+var int   dayIndex  = 0
+var int   dayStartT = na
+var float dayH      = na
+var float dayL      = na
+var float pdh       = na
+var float pdl       = na
+var float pdc       = na
+if newDay
+    if dayIndex > 0
+        pdh := dayH
+        pdl := dayL
+        pdc := close[1]
+    dayIndex  += 1
+    dayStartT := time
+    dayH      := high
+    dayL      := low
+else
+    dayH := na(dayH) ? high : math.max(dayH, high)
+    dayL := na(dayL) ? low : math.min(dayL, low)
+
+var int   weekCount  = 0
+var int   weekStartT = na
+var float wkH        = na
+var float wkL        = na
+var float pwh        = na
+var float pwl        = na
+if newWeek
+    if weekCount > 0
+        pwh := wkH
+        pwl := wkL
+    weekCount  += 1
+    weekStartT := time
+    wkH        := high
+    wkL        := low
+else
+    wkH := na(wkH) ? high : math.max(wkH, high)
+    wkL := na(wkL) ? low : math.min(wkL, low)
+
+// ── Session tracker: returns developing and last COMPLETED session H/L
+f_sess(simple string sess, simple string tz) =>
+    bool inS   = not na(time(timeframe.period, sess, tz))
+    bool wasIn = inS[1]
+    var float curH  = na
+    var float curL  = na
+    var float lastH = na
+    var float lastL = na
+    var int   curST  = na
+    var int   lastST = na
+    if inS and not wasIn
+        curH  := high
+        curL  := low
+        curST := time
+    else if inS
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+    if not inS and wasIn
+        lastH  := curH
+        lastL  := curL
+        lastST := curST
+    [inS, curH, curL, lastH, lastL, curST, lastST]
+
+[onIn, onCH, onCL, onH, onL, onCST, onST] = f_sess(iONSess, iTZ)
+[lnIn, lnCH, lnCL, lnH, lnL, lnCST, lnST] = f_sess(iLonSess, iTZ)
+[pmIn, pmCH, pmCL, pmH, pmL, pmCST, pmST] = f_sess(iPreSess, iTZ)
+[rtIn, rtCH, rtCL, rtH, rtL, rtCST, rtST] = f_sess(iRTHSess, iTZ)
+[orIn, orCH, orCL, orH, orL, orCST, orST] = f_sess(iORSess, iTZ)
+bool orToday = not na(orST) and not na(dayStartT) and orST >= dayStartT
+
+// ── Confirmed key-level list used for confluence (no developing values)
+var array<float>  refP = array.new<float>()
+var array<string> refN = array.new<string>()
+refP.clear()
+refN.clear()
+if iPD
+    refP.push(pdh)
+    refN.push("PDH")
+    refP.push(pdl)
+    refN.push("PDL")
+if iPDC
+    refP.push(pdc)
+    refN.push("PDC")
+if iPW
+    refP.push(pwh)
+    refN.push("PWH")
+    refP.push(pwl)
+    refN.push("PWL")
+if iON
+    refP.push(onH)
+    refN.push("ONH")
+    refP.push(onL)
+    refN.push("ONL")
+if iLon
+    refP.push(lnH)
+    refN.push("LDNH")
+    refP.push(lnL)
+    refN.push("LDNL")
+if iPre
+    refP.push(pmH)
+    refN.push("PMH")
+    refP.push(pmL)
+    refN.push("PML")
+if iRTH
+    refP.push(rtH)
+    refN.push("pRTHH")
+    refP.push(rtL)
+    refN.push("pRTHL")
+if iOR and orToday
+    refP.push(orH)
+    refN.push("ORH")
+    refP.push(orL)
+    refN.push("ORL")
+
+float refSum = 0.0
+for [i, p] in refP
+    refSum += nz(p) * (i + 1)
+var float prevRefSum = -1.0
+var int   refVersion = 0
+if refSum != prevRefSum
+    refVersion += 1
+    prevRefSum := refSum
+
+// ── Swing series (evaluated every bar; used only on confirmed bars)
+float ph      = ta.pivothigh(high, iSwLen, iSwLen)
+float pl      = ta.pivotlow(low, iSwLen, iSwLen)
+float winLo   = ta.lowest(low, 2 * iSwLen + 1)
+float winHi   = ta.highest(high, 2 * iSwLen + 1)
+float aftLo   = ta.lowest(low, iSwLen)
+float aftHi   = ta.highest(high, iSwLen)
+float winVol  = ta.highest(nz(volume), 2 * iSwLen + 1)
+float mph     = ta.pivothigh(high, iMajLen, iMajLen)
+float mpl     = ta.pivotlow(low, iMajLen, iMajLen)
+float mWinLo  = ta.lowest(low, 2 * iMajLen + 1)
+float mWinHi  = ta.highest(high, 2 * iMajLen + 1)
+float mAftLo  = ta.lowest(low, iMajLen)
+float mAftHi  = ta.highest(high, iMajLen)
+float mWinVol = ta.highest(nz(volume), 2 * iMajLen + 1)
+bool  volSw   = hasVol and volAvg > 0 and winVol >= volAvg * iVolMult
+bool  volMaj  = hasVol and volAvg > 0 and mWinVol >= volAvg * iVolMult
+float rwHi    = ta.highest(high, iRangeLen)
+float rwLo    = ta.lowest(low, iRangeLen)
+
+// ── Multi-timeframe pivots: [1] + lookahead_on = last CLOSED HTF bar only
+f_htfPiv(simple int len) =>
+    float hp = ta.pivothigh(high, len, len)
+    float lp = ta.pivotlow(low, len, len)
+    [hp[1], lp[1], time[len + 1]]
+
+int  chartSec = timeframe.in_seconds()
+bool ok5   = timeframe.in_seconds("5") > chartSec
+bool ok15  = timeframe.in_seconds("15") > chartSec
+bool ok30  = timeframe.in_seconds("30") > chartSec
+bool ok60  = timeframe.in_seconds("60") > chartSec
+bool ok240 = timeframe.in_seconds("240") > chartSec
+bool okD   = timeframe.in_seconds("D") > chartSec
+string tf5   = ok5 ? "5" : timeframe.period
+string tf15  = ok15 ? "15" : timeframe.period
+string tf30  = ok30 ? "30" : timeframe.period
+string tf60  = ok60 ? "60" : timeframe.period
+string tf240 = ok240 ? "240" : timeframe.period
+string tfD   = okD ? "D" : timeframe.period
+
+[h5, l5, t5]       = request.security(syminfo.tickerid, tf5, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+[h15, l15, t15]    = request.security(syminfo.tickerid, tf15, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+[h30, l30, t30]    = request.security(syminfo.tickerid, tf30, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+[h60, l60, t60]    = request.security(syminfo.tickerid, tf60, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+[h240, l240, t240] = request.security(syminfo.tickerid, tf240, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+[hD, lD, tD]       = request.security(syminfo.tickerid, tfD, f_htfPiv(iHtfLen), lookahead = barmerge.lookahead_on)
+bool nb5   = timeframe.change(tf5)
+bool nb15  = timeframe.change(tf15)
+bool nb30  = timeframe.change(tf30)
+bool nb60  = timeframe.change(tf60)
+bool nb240 = timeframe.change(tf240)
+bool nbD   = timeframe.change(tfD)
+
+// ════════════════════════════════════════════════════════════════════════════
+// LEVEL DATABASE
+// ════════════════════════════════════════════════════════════════════════════
+type Level
+    float  price
+    float  top
+    float  bot
+    int    bornTime
+    int    bornDay
+    int    createdBar
+    int    lastReactDay
+    int    dir
+    int    side
+    int    lastSwingBar
+    int    swingHits    = 0
+    bool   major        = false
+    int    rangeHits    = 0
+    int    eqHits       = 0
+    float  mtfScore     = 0.0
+    string mtfTags      = ""
+    bool   volHit       = false
+    bool   dispHit      = false
+    int    touches      = 0
+    int    rejections   = 0
+    int    breakouts    = 0
+    int    retests      = 0
+    int    fakeouts     = 0
+    int    lastTouchBar = 0
+    bool   inTouch      = false
+    bool   inApproach   = false
+    bool   rejDone      = false
+    bool   sweepDone    = false
+    int    brkDir       = 0
+    int    brkBar       = 0
+    bool   brkMoved     = false
+    int    refCount     = 0
+    string refTags      = ""
+    int    refVer       = -1
+    bool   nearVwap     = false
+    float  conf         = 0.0
+    float  strength     = 0.0
+    int    rank         = 0
+    bool   everHC       = false
+
+var array<Level> levels  = array.new<Level>()
+var array<line>  gLines  = array.new<line>()
+var array<label> gLabels = array.new<label>()
+var array<box>   gBoxes  = array.new<box>()
+
+// kind: 1 = swing, 2 = major swing, 3 = range boundary, 4 = HTF pivot
+// dir : 1 = formed as a high, -1 = formed as a low, 0 = both (S/R flip)
+f_addLevel(float p, int kind, int dir, int pivBar, int pivTime, float mtfW, string mtfTag, bool vol, bool disp) =>
+    float pr   = math.round_to_mintick(p)
+    int   idx  = -1
+    float best = mergeTol
+    for [i, l] in levels
+        float d = math.abs(pr - l.price)
+        if d <= best
+            best := d
+            idx  := i
+    Level lv = na
+    if idx >= 0
+        lv := levels.get(idx)
+        if kind == 1 and lv.swingHits > 0 and lv.dir == dir and math.abs(pr - lv.price) <= eqTol and math.abs(pivBar - lv.lastSwingBar) >= iMinBars
+            bool intact = dir == 1 ? lv.side == -1 : lv.side == 1
+            if intact
+                lv.eqHits += 1
+        lv.top := math.max(lv.top, pr)
+        lv.bot := math.min(lv.bot, pr)
+        if lv.dir != dir
+            lv.dir := 0
+    else
+        lv := Level.new(price = pr, top = pr, bot = pr, bornTime = na(pivTime) ? time : pivTime, bornDay = dayIndex, createdBar = bar_index, lastReactDay = dayIndex, dir = dir, side = close >= pr ? 1 : -1, lastSwingBar = na(pivBar) ? bar_index : pivBar, lastTouchBar = bar_index, inTouch = high >= pr - touchTol and low <= pr + touchTol)
+        levels.push(lv)
+    if kind == 1
+        lv.swingHits    += 1
+        lv.lastSwingBar := pivBar
+    else if kind == 2
+        lv.major        := true
+        lv.lastSwingBar := pivBar
+    else if kind == 3
+        lv.rangeHits += 1
+    else if kind == 4
+        lv.mtfScore += mtfW
+        if not str.contains(lv.mtfTags, mtfTag)
+            lv.mtfTags := lv.mtfTags == "" ? mtfTag : lv.mtfTags + "/" + mtfTag
+    lv.volHit       := lv.volHit or vol
+    lv.dispHit      := lv.dispHit or disp
+    lv.lastReactDay := dayIndex
+    lv.refVer       := -1
+    lv
+
+f_mtf(bool on, bool nb, float h, float l, int t, float w, string tag) =>
+    if on and nb
+        if not na(h)
+            f_addLevel(h, 4, 1, na, t, w, tag, false, false)
+        if not na(l)
+            f_addLevel(l, 4, -1, na, t, w, tag, false, false)
+    on and nb
+
+method refreshRefs(Level l) =>
+    int    cnt  = 0
+    string tags = ""
+    for [i, p] in refP
+        if not na(p) and p >= l.bot - mergeTol and p <= l.top + mergeTol
+            cnt  += 1
+            tags := tags == "" ? refN.get(i) : tags + "/" + refN.get(i)
+    l.refCount := cnt
+    l.refTags  := tags
+    l.refVer   := refVersion
+    l
+
+method rescore(Level l) =>
+    float c = 0.0
+    c += wSwing * math.min(l.swingHits, 2)
+    c += l.major ? wMajor : 0.0
+    c += wRange * math.min(l.rangeHits, 2)
+    c += wEqual * math.min(l.eqHits, 2)
+    c += wMTF * math.min(l.mtfScore, 4.0)
+    c += wRef * math.min(l.refCount, 3)
+    c += l.nearVwap ? wVWAP : 0.0
+    c += wTouch * math.min(l.touches, 6)
+    c += wReject * math.min(l.rejections, 4)
+    c += wRetest * math.min(l.retests, 3)
+    c += wFake * math.min(l.fakeouts, 3)
+    c += l.volHit ? wVol : 0.0
+    c += l.dispHit ? wDisp : 0.0
+    c -= wChop * math.min(math.max(l.breakouts - l.retests - l.fakeouts - 1, 0), 4)
+    c := math.max(c, 0.0)
+    float s = c * math.pow(iDecay, dayIndex - l.lastReactDay)
+    l.conf     := c
+    l.strength := s
+    l.rank     := s >= thHC ? 3 : s >= thStrong ? 2 : s >= thMod ? 1 : 0
+    l
+
+f_rankOf(string s) =>
+    s == "High Confluence" ? 3 : s == "Strong" ? 2 : 1
+
+f_cls(int r) =>
+    r == 3 ? "HC" : r == 2 ? "Strong" : r == 1 ? "Moderate" : "Weak"
+
+f_typeName(Level l) =>
+    string hl = l.dir == 1 ? "HIGH" : l.dir == -1 ? "LOW" : "FLIP"
+    l.major ? "MAJOR " + hl : l.rangeHits > 0 ? "RANGE " + hl : l.eqHits > 0 ? (l.dir == 1 ? "EQH" : l.dir == -1 ? "EQL" : "EQ") : l.swingHits > 0 ? "SWING " + hl : "HTF " + hl
+
+f_labelText(Level l) =>
+    string head = l.rank == 3 ? "HC" : f_typeName(l)
+    string txt  = head + " " + str.tostring(l.strength, "#.#") + " | " + str.tostring(l.touches) + "T"
+    if l.refTags != ""
+        txt := txt + " · " + l.refTags
+    if iLabelDetail
+        string extra = l.rank == 3 ? f_typeName(l) : ""
+        if l.mtfTags != ""
+            extra := extra == "" ? l.mtfTags : extra + " · " + l.mtfTags
+        if l.fakeouts > 0
+            extra := extra + " · FB" + str.tostring(l.fakeouts)
+        if l.retests > 0
+            extra := extra + " · RT" + str.tostring(l.retests)
+        if extra != ""
+            txt := txt + "\n" + extra
+    if iLabelPrice
+        txt := txt + "  " + str.tostring(l.price, format.mintick)
+    txt
+
+f_px(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+f_key(float p, string name, int startT, color col, string st) =>
+    if not na(p)
+        int x1 = na(startT) ? time : startT
+        gLines.push(line.new(x1, p, time, p, xloc = xloc.bar_time, extend = extend.right, color = col, style = st, width = 1))
+        if iKeyLabels
+            gLabels.push(label.new(bar_index + 2, p, name, style = label.style_label_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny))
+
+// ════════════════════════════════════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════════════════════════════════════
+var float lastSHp = na
+var int   lastSHb = -100000
+var float lastSLp = na
+var int   lastSLb = -100000
+
+var bool  rActive  = false
+var float rHi      = na
+var float rLo      = na
+var int   rStart   = 0
+var int   rStartT  = na
+var int   rHiTests = 0
+var int   rLoTests = 0
+var bool  rHiIn    = false
+var bool  rLoIn    = false
+var int   rEndBar  = -100000
+var float lastRH   = na
+var float lastRL   = na
+
+bool   ready     = iEnable and barstate.isconfirmed and not na(atrVal)
+int    alertRank = f_rankOf(iAlertClass)
+int    brkRank   = f_rankOf(iBrkClass)
+
+bool   sigApproach = false
+bool   sigTouch    = false
+bool   sigRejRes   = false
+bool   sigRejSup   = false
+bool   sigBreakUp  = false
+bool   sigBreakDn  = false
+bool   sigRetestUp = false
+bool   sigRetestDn = false
+bool   sigFakeUp   = false
+bool   sigFakeDn   = false
+bool   sigMajorTop = false
+bool   sigMajorBot = false
+bool   sigNewHC    = false
+string msgApproach = ""
+string msgTouch    = ""
+string msgReject   = ""
+string msgBreak    = ""
+string msgRetest   = ""
+string msgFake     = ""
+string msgMajor    = ""
+string msgNewHC    = ""
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1) INTERACTIONS WITH EXISTING LEVELS (confirmed bars only)
+// ════════════════════════════════════════════════════════════════════════════
+if ready
+    float apDist  = iApproachATR * atrVal
+    float rejDist = iRejATR * atrVal
+    for lv in levels
+        float zt        = lv.top
+        float zb        = lv.bot
+        string ps       = str.tostring(lv.price, format.mintick)
+        bool  touched   = high >= zb - touchTol and low <= zt + touchTol
+        float dist      = close > zt ? close - zt : close < zb ? zb - close : 0.0
+        bool  canAlert  = lv.rank >= alertRank
+        bool  canBrkAl  = lv.rank >= brkRank
+
+        // approach (edge-triggered)
+        bool nearNow = dist <= apDist
+        if nearNow and not lv.inApproach and not touched and canAlert
+            sigApproach := true
+            msgApproach := "NQ Levels: approaching " + f_cls(lv.rank) + " level " + ps
+        lv.inApproach := nearNow
+
+        // touch (edge-triggered with cooldown)
+        if touched and not lv.inTouch and bar_index - lv.lastTouchBar >= iTouchCool
+            lv.touches      += 1
+            lv.lastTouchBar := bar_index
+            lv.lastReactDay := dayIndex
+            lv.rejDone      := false
+            lv.sweepDone    := false
+            if canAlert
+                sigTouch := true
+                msgTouch := "NQ Levels: touched " + f_cls(lv.rank) + " level " + ps
+        lv.inTouch := touched
+
+        // follow-up after a close-break: false breakout or retest
+        bool handled = false
+        if lv.brkDir != 0 and bar_index > lv.brkBar
+            int age = bar_index - lv.brkBar
+            if lv.brkDir == 1
+                if age <= iFakeBars and close < lv.price
+                    lv.fakeouts     += 1
+                    lv.side         := -1
+                    lv.brkDir       := 0
+                    lv.lastReactDay := dayIndex
+                    handled         := true
+                    if canBrkAl
+                        sigFakeUp := true
+                        msgFake   := "NQ Levels: FALSE breakout above " + ps + " (back below)"
+                else
+                    if high - zt >= iRetestMove * atrVal
+                        lv.brkMoved := true
+                    if lv.brkMoved and low <= zt + touchTol and close > zt
+                        lv.retests      += 1
+                        lv.brkDir       := 0
+                        lv.lastReactDay := dayIndex
+                        handled         := true
+                        if canBrkAl
+                            sigRetestUp := true
+                            msgRetest   := "NQ Levels: breakout + retest HELD at " + ps + " (resistance -> support)"
+                    else if age > iRetestMax
+                        lv.brkDir := 0
+            else
+                if age <= iFakeBars and close > lv.price
+                    lv.fakeouts     += 1
+                    lv.side         := 1
+                    lv.brkDir       := 0
+                    lv.lastReactDay := dayIndex
+                    handled         := true
+                    if canBrkAl
+                        sigFakeDn := true
+                        msgFake   := "NQ Levels: FALSE breakdown below " + ps + " (back above)"
+                else
+                    if zb - low >= iRetestMove * atrVal
+                        lv.brkMoved := true
+                    if lv.brkMoved and high >= zb - touchTol and close < zb
+                        lv.retests      += 1
+                        lv.brkDir       := 0
+                        lv.lastReactDay := dayIndex
+                        handled         := true
+                        if canBrkAl
+                            sigRetestDn := true
+                            msgRetest   := "NQ Levels: breakdown + retest HELD at " + ps + " (support -> resistance)"
+                    else if age > iRetestMax
+                        lv.brkDir := 0
+
+        if not handled
+            if lv.side == -1 and close > zt + breakBuf
+                lv.side      := 1
+                lv.breakouts += 1
+                lv.brkDir    := 1
+                lv.brkBar    := bar_index
+                lv.brkMoved  := false
+                if canBrkAl
+                    sigBreakUp := true
+                    msgBreak   := "NQ Levels: breakout ABOVE " + f_cls(lv.rank) + " level " + ps
+            else if lv.side == 1 and close < zb - breakBuf
+                lv.side      := -1
+                lv.breakouts += 1
+                lv.brkDir    := -1
+                lv.brkBar    := bar_index
+                lv.brkMoved  := false
+                if canBrkAl
+                    sigBreakDn := true
+                    msgBreak   := "NQ Levels: breakdown BELOW " + f_cls(lv.rank) + " level " + ps
+            else if touched
+                if lv.side == -1
+                    if not lv.sweepDone and high > zt + breakBuf and close < lv.price
+                        lv.fakeouts     += 1
+                        lv.sweepDone    := true
+                        lv.lastReactDay := dayIndex
+                        if canBrkAl
+                            sigFakeUp := true
+                            msgFake   := "NQ Levels: liquidity sweep / failed break above " + ps
+                    if not lv.rejDone and close <= zb - rejDist
+                        lv.rejections   += 1
+                        lv.rejDone      := true
+                        lv.lastReactDay := dayIndex
+                        if canAlert
+                            sigRejRes := true
+                            msgReject := "NQ Levels: REJECTION at " + f_cls(lv.rank) + " resistance " + ps
+                else
+                    if not lv.sweepDone and low < zb - breakBuf and close > lv.price
+                        lv.fakeouts     += 1
+                        lv.sweepDone    := true
+                        lv.lastReactDay := dayIndex
+                        if canBrkAl
+                            sigFakeDn := true
+                            msgFake   := "NQ Levels: liquidity sweep / failed break below " + ps
+                    if not lv.rejDone and close >= zt + rejDist
+                        lv.rejections   += 1
+                        lv.rejDone      := true
+                        lv.lastReactDay := dayIndex
+                        if canAlert
+                            sigRejSup := true
+                            msgReject := "NQ Levels: REJECTION at " + f_cls(lv.rank) + " support " + ps
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2) NEW LEVEL DETECTION (confirmed bars only)
+// ════════════════════════════════════════════════════════════════════════════
+if ready
+    // ── Minor swing high
+    if not na(ph)
+        int  pb     = bar_index - iSwLen
+        bool promOK = ph - winLo >= iMinProm * atrVal
+        bool legOK  = na(lastSLp) or ph - lastSLp >= iMinLeg * atrVal
+        bool gapOK  = pb - lastSHb >= iMinBars
+        bool volOK  = not iReqVol or not hasVol or volSw
+        if promOK and legOK and gapOK and volOK
+            f_addLevel(ph, 1, 1, pb, time[iSwLen], 0.0, "", volSw, ph - aftLo >= iDispATR * atrVal)
+            lastSHp := ph
+            lastSHb := pb
+    // ── Minor swing low
+    if not na(pl)
+        int  pb     = bar_index - iSwLen
+        bool promOK = winHi - pl >= iMinProm * atrVal
+        bool legOK  = na(lastSHp) or lastSHp - pl >= iMinLeg * atrVal
+        bool gapOK  = pb - lastSLb >= iMinBars
+        bool volOK  = not iReqVol or not hasVol or volSw
+        if promOK and legOK and gapOK and volOK
+            f_addLevel(pl, 1, -1, pb, time[iSwLen], 0.0, "", volSw, aftHi - pl >= iDispATR * atrVal)
+            lastSLp := pl
+            lastSLb := pb
+    // ── Major swing high / low
+    if not na(mph) and mph - mWinLo >= iMajProm * atrVal
+        f_addLevel(mph, 2, 1, bar_index - iMajLen, time[iMajLen], 0.0, "", volMaj, mph - mAftLo >= iDispATR * atrVal)
+        sigMajorTop := true
+        msgMajor    := "NQ Levels: new MAJOR TOP confirmed at " + str.tostring(mph, format.mintick)
+    if not na(mpl) and mWinHi - mpl >= iMajProm * atrVal
+        f_addLevel(mpl, 2, -1, bar_index - iMajLen, time[iMajLen], 0.0, "", volMaj, mAftHi - mpl >= iDispATR * atrVal)
+        sigMajorBot := true
+        msgMajor    := "NQ Levels: new MAJOR BOTTOM confirmed at " + str.tostring(mpl, format.mintick)
+
+    // ── Higher-timeframe pivots (closed HTF bars only)
+    f_mtf(iTf5 and ok5, nb5, h5, l5, t5, 0.5, "5m")
+    f_mtf(iTf15 and ok15, nb15, h15, l15, t15, 0.75, "15m")
+    f_mtf(iTf30 and ok30, nb30, h30, l30, t30, 1.0, "30m")
+    f_mtf(iTf60 and ok60, nb60, h60, l60, t60, 1.25, "1H")
+    f_mtf(iTf240 and ok240, nb240, h240, l240, t240, 1.5, "4H")
+    f_mtf(iTfD and okD, nbD, hD, lD, tD, 2.0, "D")
+
+    // ── Range detection
+    if iRangeOn
+        if not rActive
+            if bar_index >= iRangeLen and rwHi - rwLo <= iRangeATR * atrVal and bar_index - iRangeLen + 1 >= rEndBar
+                rActive  := true
+                rHi      := rwHi
+                rLo      := rwLo
+                rStart   := bar_index - iRangeLen + 1
+                rStartT  := time[iRangeLen - 1]
+                rHiTests := 0
+                rLoTests := 0
+                bool pH = false
+                bool pL = false
+                for i = iRangeLen - 1 to 0
+                    bool tH = high[i] >= rHi - touchTol
+                    bool tL = low[i] <= rLo + touchTol
+                    if tH and not pH
+                        rHiTests += 1
+                    if tL and not pL
+                        rLoTests += 1
+                    pH := tH
+                    pL := tL
+                rHiIn := pH
+                rLoIn := pL
+        else
+            bool brkUpR  = close > rHi + breakBuf
+            bool brkDnR  = close < rLo - breakBuf
+            bool tooWide = math.max(rHi, high) - math.min(rLo, low) > iRangeATR * 1.5 * atrVal
+            if brkUpR or brkDnR or tooWide
+                if bar_index - rStart >= iRangeMin
+                    if rHiTests >= iRangeTests
+                        Level rh = f_addLevel(rHi, 3, 1, rStart, rStartT, 0.0, "", false, false)
+                        if brkUpR and rh.createdBar == bar_index
+                            rh.breakouts += 1
+                            rh.brkDir    := 1
+                            rh.brkBar    := bar_index
+                            rh.brkMoved  := false
+                    if rLoTests >= iRangeTests
+                        Level rl = f_addLevel(rLo, 3, -1, rStart, rStartT, 0.0, "", false, false)
+                        if brkDnR and rl.createdBar == bar_index
+                            rl.breakouts += 1
+                            rl.brkDir    := -1
+                            rl.brkBar    := bar_index
+                            rl.brkMoved  := false
+                    lastRH := rHi
+                    lastRL := rLo
+                    if brkUpR
+                        sigBreakUp := true
+                        msgBreak   := "NQ Levels: RANGE breakout UP above " + str.tostring(rHi, format.mintick)
+                    if brkDnR
+                        sigBreakDn := true
+                        msgBreak   := "NQ Levels: RANGE breakdown BELOW " + str.tostring(rLo, format.mintick)
+                rActive := false
+                rEndBar := bar_index
+            else
+                bool tH = high >= rHi - touchTol
+                bool tL = low <= rLo + touchTol
+                if tH and not rHiIn
+                    rHiTests += 1
+                if tL and not rLoIn
+                    rLoTests += 1
+                rHiIn := tH
+                rLoIn := tL
+                rHi   := math.max(rHi, high)
+                rLo   := math.min(rLo, low)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3) SCORING, NEW-HC DETECTION, PRUNING (confirmed bars only)
+// ════════════════════════════════════════════════════════════════════════════
+if ready
+    for lv in levels
+        lv.nearVwap := iUseVWAP and not na(vwapVal) and math.abs(vwapVal - lv.price) <= mergeTol
+        if lv.refVer != refVersion
+            lv.refreshRefs()
+        lv.rescore()
+        if lv.rank == 3 and not lv.everHC
+            lv.everHC := true
+            sigNewHC  := true
+            msgNewHC  := "NQ Levels: NEW high-confluence level " + str.tostring(lv.price, format.mintick) + " (score " + str.tostring(lv.strength, "#.#") + ")"
+    // age-based removal
+    if levels.size() > 0
+        for i = levels.size() - 1 to 0
+            Level l = levels.get(i)
+            if dayIndex - l.lastReactDay > iHistDays or dayIndex - l.bornDay > iHistDays * 2
+                levels.remove(i)
+    // capacity-based removal (weakest first)
+    while levels.size() > iMaxLevels
+        int   wi = 0
+        float ws = 1e10
+        for [i, l] in levels
+            if l.strength < ws
+                ws := l.strength
+                wi := i
+        levels.remove(wi)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 4) DRAWING (last bar only: delete + redraw a bounded set of objects)
+// ════════════════════════════════════════════════════════════════════════════
+int lblMinRank = iLabelMode == "None" ? 99 : iLabelMode == "HC only" ? 3 : iLabelMode == "Strong+" ? 2 : 1
+
+if barstate.islast
+    for ln in gLines
+        ln.delete()
+    gLines.clear()
+    for lb in gLabels
+        lb.delete()
+    gLabels.clear()
+    for bx in gBoxes
+        bx.delete()
+    gBoxes.clear()
+
+    if iEnable
+        // ── Key levels (confirmed) and developing values
+        if iPD
+            f_key(pdh, "PDH", dayStartT, iColKey, line.style_solid)
+            f_key(pdl, "PDL", dayStartT, iColKey, line.style_solid)
+        if iPDC
+            f_key(pdc, "PDC", dayStartT, color.new(iColKey, 40), line.style_dotted)
+        if iPW
+            f_key(pwh, "PWH", weekStartT, iColWeek, line.style_solid)
+            f_key(pwl, "PWL", weekStartT, iColWeek, line.style_solid)
+        if iCD
+            f_key(dayH, "CDH·dev", dayStartT, iColDev, line.style_dotted)
+            f_key(dayL, "CDL·dev", dayStartT, iColDev, line.style_dotted)
+        if iON
+            if onIn
+                f_key(onCH, "ONH·dev", onCST, iColDev, line.style_dotted)
+                f_key(onCL, "ONL·dev", onCST, iColDev, line.style_dotted)
+            else
+                f_key(onH, "ONH", onST, iColSess, line.style_dashed)
+                f_key(onL, "ONL", onST, iColSess, line.style_dashed)
+        if iLon
+            if lnIn
+                f_key(lnCH, "LDNH·dev", lnCST, iColDev, line.style_dotted)
+                f_key(lnCL, "LDNL·dev", lnCST, iColDev, line.style_dotted)
+            else
+                f_key(lnH, "LDNH", lnST, iColSess, line.style_dashed)
+                f_key(lnL, "LDNL", lnST, iColSess, line.style_dashed)
+        if iPre
+            if pmIn
+                f_key(pmCH, "PMH·dev", pmCST, iColDev, line.style_dotted)
+                f_key(pmCL, "PML·dev", pmCST, iColDev, line.style_dotted)
+            else
+                f_key(pmH, "PMH", pmST, iColSess, line.style_dashed)
+                f_key(pmL, "PML", pmST, iColSess, line.style_dashed)
+        if iRTH
+            f_key(rtH, "pRTH H", rtST, color.new(iColKey, 25), line.style_dashed)
+            f_key(rtL, "pRTH L", rtST, color.new(iColKey, 25), line.style_dashed)
+            if rtIn
+                f_key(rtCH, "RTH H·dev", rtCST, iColDev, line.style_dotted)
+                f_key(rtCL, "RTH L·dev", rtCST, iColDev, line.style_dotted)
+        if iOR
+            if orIn
+                f_key(orCH, "ORH·dev", orCST, iColDev, line.style_dotted)
+                f_key(orCL, "ORL·dev", orCST, iColDev, line.style_dotted)
+            else if orToday
+                f_key(orH, "ORH", orST, iColHC, line.style_dashed)
+                f_key(orL, "ORL", orST, iColHC, line.style_dashed)
+
+        // ── Developing range (unconfirmed)
+        if iRangeOn and iDevRange and rActive and not na(rStartT)
+            float rMid = (rHi + rLo) / 2.0
+            gBoxes.push(box.new(rStartT, rHi, time, rLo, xloc = xloc.bar_time, border_color = color.new(iColRange, 30), border_style = line.style_dashed, bgcolor = color.new(iColRange, 92)))
+            gLines.push(line.new(rStartT, rMid, time, rMid, xloc = xloc.bar_time, color = color.new(iColRange, 40), style = line.style_dotted, width = 1))
+            gLabels.push(label.new(bar_index + 2, rHi, "RANGE·dev " + str.tostring(rHiTests) + "/" + str.tostring(rLoTests) + " tests", style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = iColRange, size = size.tiny))
+
+        // ── Structural levels: strongest first, visually de-duplicated
+        if levels.size() > 0
+            array<float> strengths = array.new<float>()
+            for lv in levels
+                strengths.push(lv.strength)
+            array<int>   idxs  = strengths.sort_indices(order.descending)
+            array<float> drawn = array.new<float>()
+            int shown = 0
+            for k in idxs
+                if shown >= iMaxVisible
+                    break
+                Level lv = levels.get(k)
+                bool rankOK = (lv.rank == 0 and iShowWeak) or (lv.rank == 1 and iShowMod) or (lv.rank == 2 and iShowStrong) or (lv.rank == 3 and iShowHC)
+                if not rankOK or lv.strength < iMinStrength
+                    continue
+                bool dup = false
+                for dp in drawn
+                    if math.abs(dp - lv.price) <= mergeTol
+                        dup := true
+                        break
+                if dup
+                    continue
+                drawn.push(lv.price)
+                shown += 1
+
+                int   bornAge = dayIndex - lv.bornDay
+                int   quiet   = dayIndex - lv.lastReactDay
+                bool  isRes   = lv.price >= close
+                color base    = lv.rank == 3 ? iColHC : isRes ? iColRes : iColSup
+                int   tr      = lv.rank == 3 ? 0 : lv.rank == 2 ? 15 : lv.rank == 1 ? 35 : 55
+                tr := math.min(tr + quiet * iHistFade, 85)
+                string st = lv.rank == 3 ? line.style_solid : bornAge >= 3 ? line.style_dotted : bornAge >= 1 ? line.style_dashed : lv.rangeHits > 0 ? line.style_dashed : line.style_solid
+                int w = iLineW + (lv.rank >= 2 ? 1 : 0) + (lv.rank == 3 ? 1 : 0)
+                gLines.push(line.new(lv.bornTime, lv.price, time, lv.price, xloc = xloc.bar_time, extend = extend.right, color = color.new(base, tr), style = st, width = w))
+                if iShowZones and lv.rank >= 2 and lv.top - lv.bot >= 2 * syminfo.mintick
+                    gBoxes.push(box.new(lv.bornTime, lv.top, time, lv.bot, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(base, 100), bgcolor = color.new(base, math.min(tr + 80, 95))))
+                if lv.rank >= lblMinRank
+                    gLabels.push(label.new(bar_index + iLabelOff, lv.price, f_labelText(lv), style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(base, math.min(tr, 40)), size = size.small))
+
+// ════════════════════════════════════════════════════════════════════════════
+// 5) TOP / BOTTOM MAP TABLE
+// ════════════════════════════════════════════════════════════════════════════
+var table tbl = na
+if barstate.isfirst and iShowTable
+    tbl := table.new(position.top_right, 2, 9, bgcolor = color.new(#131722, 10), frame_color = color.new(#787B86, 50), frame_width = 1, border_color = color.new(#787B86, 85), border_width = 1)
+
+f_cell(table t, int r, string a, string b, color cb) =>
+    table.cell(t, 0, r, a, text_color = color.new(#B2B5BE, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, b, text_color = cb, text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast and iShowTable and iEnable and not na(tbl)
+    float nRes = na
+    float nSup = na
+    Level sRes = na
+    Level sSup = na
+    for lv in levels
+        if lv.strength >= iMinStrength
+            if lv.price > close
+                if na(nRes) or lv.price < nRes
+                    nRes := lv.price
+                if na(sRes) or lv.strength > sRes.strength
+                    sRes := lv
+            else
+                if na(nSup) or lv.price > nSup
+                    nSup := lv.price
+                if na(sSup) or lv.strength > sSup.strength
+                    sSup := lv
+    color  cTxt   = color.new(#D1D4DC, 0)
+    string txNRes = "—"
+    string txNSup = "—"
+    string txSRes = "—"
+    string txSSup = "—"
+    if not na(nRes)
+        txNRes := f_px(nRes) + "  (+" + str.tostring(nRes - close, "#.##") + ")"
+    if not na(nSup)
+        txNSup := f_px(nSup) + "  (-" + str.tostring(close - nSup, "#.##") + ")"
+    if not na(sRes)
+        txSRes := f_px(sRes.price) + "  · " + str.tostring(sRes.strength, "#.#")
+    if not na(sSup)
+        txSSup := f_px(sSup.price) + "  · " + str.tostring(sSup.strength, "#.#")
+    f_cell(tbl, 0, "NQ LEVEL MAP", timeframe.period, iColHC)
+    f_cell(tbl, 1, "Price", f_px(close), cTxt)
+    f_cell(tbl, 2, "Nearest resistance", txNRes, iColRes)
+    f_cell(tbl, 3, "Nearest support", txNSup, iColSup)
+    f_cell(tbl, 4, "Strongest resistance", txSRes, iColRes)
+    f_cell(tbl, 5, "Strongest support", txSSup, iColSup)
+    f_cell(tbl, 6, "Range", rActive ? "Developing" : na(lastRH) ? "None" : "Last confirmed", iColRange)
+    f_cell(tbl, 7, "Range high", rActive ? f_px(rHi) : f_px(lastRH), iColRange)
+    f_cell(tbl, 8, "Range low", rActive ? f_px(rLo) : f_px(lastRL), iColRange)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 6) MARKERS (printed on the confirmation bar — never back-dated)
+// ════════════════════════════════════════════════════════════════════════════
+plotshape(iShowSignals and sigBreakUp, "Breakout up", shape.triangleup, location.belowbar, iColSup, size = size.tiny)
+plotshape(iShowSignals and sigBreakDn, "Breakout down", shape.triangledown, location.abovebar, iColRes, size = size.tiny)
+plotshape(iShowSignals and sigRetestUp, "Retest held (new support)", shape.circle, location.belowbar, iColSup, size = size.tiny)
+plotshape(iShowSignals and sigRetestDn, "Retest held (new resistance)", shape.circle, location.abovebar, iColRes, size = size.tiny)
+plotshape(iShowSignals and sigFakeUp, "False break up", shape.xcross, location.abovebar, iColHC, size = size.tiny)
+plotshape(iShowSignals and sigFakeDn, "False break down", shape.xcross, location.belowbar, iColHC, size = size.tiny)
+plotshape(iShowRejects and sigRejRes, "Rejection at resistance", shape.diamond, location.abovebar, color.new(iColRes, 30), size = size.tiny)
+plotshape(iShowRejects and sigRejSup, "Rejection at support", shape.diamond, location.belowbar, color.new(iColSup, 30), size = size.tiny)
+plotshape(iShowMajor and sigMajorTop, "Major top confirmed", shape.labeldown, location.abovebar, color.new(iColRes, 20), text = "TOP", textcolor = color.white, size = size.tiny)
+plotshape(iShowMajor and sigMajorBot, "Major bottom confirmed", shape.labelup, location.belowbar, color.new(iColSup, 20), text = "BOT", textcolor = color.white, size = size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 7) ALERTS
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(iAlApproach and sigApproach, "Approaching HC level", "NQ Levels: price approaching a high-confluence level")
+alertcondition(iAlTouch and sigTouch, "Touch HC level", "NQ Levels: price touched a high-confluence level")
+alertcondition(iAlReject and (sigRejRes or sigRejSup), "Rejection at HC level", "NQ Levels: rejection at a high-confluence level")
+alertcondition(iAlBreak and (sigBreakUp or sigBreakDn), "Breakout of important level", "NQ Levels: important level broken on close")
+alertcondition(iAlRetest and (sigRetestUp or sigRetestDn), "Breakout + retest", "NQ Levels: breakout and retest held")
+alertcondition(iAlFake and (sigFakeUp or sigFakeDn), "False breakout", "NQ Levels: false breakout / liquidity sweep")
+alertcondition(iAlMajor and sigMajorTop, "New major top", "NQ Levels: new major top confirmed")
+alertcondition(iAlMajor and sigMajorBot, "New major bottom", "NQ Levels: new major bottom confirmed")
+alertcondition(iAlNewHC and sigNewHC, "New high-confluence level", "NQ Levels: a level reached high-confluence status")
+
+if iAlertFn and iEnable
+    if iAlApproach and sigApproach
+        alert(msgApproach, alert.freq_once_per_bar_close)
+    if iAlTouch and sigTouch
+        alert(msgTouch, alert.freq_once_per_bar_close)
+    if iAlReject and (sigRejRes or sigRejSup)
+        alert(msgReject, alert.freq_once_per_bar_close)
+    if iAlBreak and (sigBreakUp or sigBreakDn)
+        alert(msgBreak, alert.freq_once_per_bar_close)
+    if iAlRetest and (sigRetestUp or sigRetestDn)
+        alert(msgRetest, alert.freq_once_per_bar_close)
+    if iAlFake and (sigFakeUp or sigFakeDn)
+        alert(msgFake, alert.freq_once_per_bar_close)
+    if iAlMajor and (sigMajorTop or sigMajorBot)
+        alert(msgMajor, alert.freq_once_per_bar_close)
+    if iAlNewHC and sigNewHC
+        alert(msgNewHC, alert.freq_once_per_bar_close)

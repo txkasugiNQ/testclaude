@@ -1,0 +1,4 @@
+*.pkl
+run*.txt
+__pycache__/
+grid_*.png

@@ -1,0 +1,120 @@
+train days 386
+created per day by source:
+ edir
+swing(1m)    130.6
+HTF pivot     58.0
+major(1m)     45.0
+range          1.2
+Name: count, dtype: float64
+HTF created per day by TF:
+ x2
+5m     39.9
+15m    13.4
+1H      3.5
+4H      1.0
+D       0.2
+Name: count, dtype: float64
+merges per day by source:
+ edir
+swing(1m)    29.9
+HTF pivot    17.4
+major(1m)    12.9
+range         0.4
+Name: count, dtype: float64
+level lifetime (1m bars):
+ count    90607.0
+mean       287.0
+std       1860.0
+min          0.0
+10%          0.0
+25%          0.0
+50%          0.0
+75%          0.0
+90%          0.0
+99%      13560.0
+max      15180.0
+Name: life, dtype: float64
+pool 0: touches/day 301
+pool 1: touches/day 100
+pool 2: touches/day 594
+rank at touch (0 weak,1 mod,2 strong,3 HC):
+ rank
+0.0    0.007
+1.0    0.011
+2.0    0.017
+3.0    0.965
+Name: proportion, dtype: float64
+touch number distribution (touches before this one):
+ touches
+0.0     0.019
+1.0     0.019
+2.0     0.019
+3.0     0.018
+4.0     0.018
+5.0     0.018
+6.0     0.018
+7.0     0.017
+8.0     0.017
+9.0     0.017
+10.0    0.819
+Name: proportion, dtype: float64
+strength at touch:
+ count    116051.00
+mean         18.55
+std           4.40
+min           0.50
+25%          17.21
+50%          19.25
+75%          21.25
+90%          23.25
+99%          26.00
+max          30.75
+Name: strength, dtype: float64
+kind combos at touch:
+ kind
+11    0.703
+1     0.194
+15    0.040
+3     0.033
+9     0.010
+10    0.009
+8     0.005
+5     0.003
+2     0.001
+13    0.000
+Name: proportion, dtype: float64
+ATR 1m by year:
+ t
+2022    3.60
+2023    3.81
+2024    4.87
+2025    6.54
+Name: atr, dtype: float64
+mergeTol median pts 1.257014173913808 touchTol 0.628507086956904
+distance to nearest other structural level at touch (ATR):
+ count    116051.00
+mean          0.94
+std           4.19
+min           0.02
+10%           0.09
+25%           0.14
+50%           0.29
+75%           0.59
+90%           1.35
+max         204.27
+dtype: float64
+n other levels within 1 ATR:
+ n_s10
+0.0     0.137
+1.0     0.142
+2.0     0.130
+3.0     0.101
+4.0     0.081
+5.0     0.064
+6.0     0.050
+7.0     0.041
+8.0     0.033
+9.0     0.030
+10.0    0.028
+11.0    0.025
+Name: proportion, dtype: float64
