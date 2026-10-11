@@ -1,0 +1,323 @@
+//@version=6
+// =====================================================================================================
+// NQ Day-Trend Pullback Continuation  (research Phase 2 candidate)
+// Port of research/p2 (signals.py, candidates.py, system.py, sim.py). Same rules, same order of operations.
+// CHART: NQ1! (or NQ contract) on the 1-MINUTE timeframe. Exchange time is converted to America/New_York.
+//
+// Logic summary
+//  1) Build 5-minute bars from the 1-minute bars (blocks aligned to the 18:00 ET session grid).
+//  2) ARM events on completed 5m bars (known only after the 5m bar closed):
+//       AM_H2 / MID_H2 : 5m impulse  (close - close[3 bars] >= 1.5*ATR5(20)) AND another same-direction
+//                        5m impulse within the previous 6 bars (30 min) of the same session (impulse cluster).
+//       MID_H3         : compression -> expansion: range of previous 6 5m bars <= 2.5*ATR5 and this 5m bar closes
+//                        beyond that range with its own range >= 1.0*ATR5.
+//  3) ENTRY MACHINE on 1m bars per arm (pullback resumption): after the impulse extreme, at least one 1m pullback bar,
+//     depth >= 0.5*ATR1m(20)[1], then a 1m bar closes above the previous bar's high (long) -> market entry next bar open.
+//     Pullback deeper than 60% of the impulse size -> arm dies. Arm expires after 20 (H2) / 30 (H3) bars. 1 entry per arm.
+//  4) Filters: entry bar inside the module window; direction == side of price vs. today's 09:30 ET open.
+//  5) STOP: the farther of (pullback extreme -/+ 1 tick) and (signal close -/+ 2.0*ATR1m), rounded to tick.
+//  6) EXIT: stop, or time exit after 60 bars in trade / at the 15:54 ET bar (market, fills next bar open).
+//  7) DAILY RULE: realised day R >= +1 or <= -1 -> no new trades that session (an open trade keeps running).
+//  Optional BE / fixed-R trailing inputs exist for comparison; defaults OFF (research showed they lower expectancy).
+// Known differences to the research backtest: research excluded half-day sessions; TradingView history depth on 1m
+// is limited; 5m bars with a missing final minute complete one bar later here.
+// =====================================================================================================
+strategy("NQ Day-Trend Pullback Continuation", shorttitle = "NQ-DTPC", overlay = true,
+     process_orders_on_close = false, calc_on_every_tick = false, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 100000,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.0, slippage = 0,
+     max_bars_back = 500)
+
+// ----------------------------------------------------------------------------------------------------- inputs
+gM = "Modules"
+useAM  = input.bool(true, "AM_H2: 5m impulse cluster", group = gM)
+useMH2 = input.bool(true, "MID_H2: 5m impulse cluster", group = gM)
+useMH3 = input.bool(true, "MID_H3: 5m compression -> breakout", group = gM)
+gW = "Entry windows (minutes after 00:00 ET, entry bar start)"
+amStart  = input.int(585, "AM start  (585 = 09:45)", group = gW)
+amEnd    = input.int(735, "AM end    (735 = 12:15)", group = gW)
+midStart = input.int(720, "MID start (720 = 12:00)", group = gW)
+midEnd   = input.int(870, "MID end   (870 = 14:30)", group = gW)
+gS = "Setup"
+impK     = input.float(1.5, "5m impulse: 3-bar move >= x * ATR5", group = gS)
+clustB   = input.int(6, "Cluster lookback (5m bars)", group = gS)
+compK    = input.float(2.5, "Compression: 6-bar range <= x * ATR5", group = gS)
+lookB    = input.int(6, "Compression lookback (5m bars)", group = gS)
+brkK     = input.float(1.0, "Breakout bar range >= x * ATR5", group = gS)
+dminK    = input.float(0.5, "Min pullback depth (x ATR1m)", group = gS)
+retrMax  = input.float(0.6, "Max pullback (fraction of impulse)", group = gS)
+expH2    = input.int(20, "Arm expiry H2 (1m bars)", group = gS)
+expH3    = input.int(30, "Arm expiry H3 (1m bars)", group = gS)
+useDayF  = input.bool(true, "Trade only in day direction (vs 09:30 open)", group = gS)
+gR = "Risk / exits"
+floorK   = input.float(2.0, "Stop at least x * ATR1m from signal close", group = gR)
+maxBars  = input.int(60, "Time exit: bars in trade", group = gR)
+flatTod  = input.int(954, "Flat: exit at bar >= (954 = 15:54 ET)", group = gR)
+dayUp    = input.float(1.0, "Daily stop: realised R >= +", group = gR)
+dayDn    = input.float(-1.0, "Daily stop: realised R <= ", group = gR)
+gO = "Optional management (research default OFF)"
+beTrig   = input.float(0.0, "BE trigger (R MFE, 0 = off)", group = gO)
+beOff    = input.float(0.0, "BE offset (R)", group = gO)
+trAct    = input.float(0.0, "Fixed-R trail activation (R MFE, 0 = off)", group = gO)
+trDist   = input.float(0.0, "Fixed-R trail distance (R)", group = gO)
+
+// ----------------------------------------------------------------------------------------------------- time / session
+TZ   = "America/New_York"
+tod  = hour(time, TZ) * 60 + minute(time, TZ)              // bar START time, minutes since 00:00 ET
+smin = (tod - 1080 + 1440) % 1440                           // minutes since 18:00 ET
+newSess = bar_index == 0 or (tod >= 1080 and tod[1] < 1080)
+var int sid = 0
+if newSess
+    sid += 1
+
+atr1 = ta.sma(ta.tr(true), 20)
+
+var float rthOpen = na
+if newSess
+    rthOpen := na
+if tod == 570
+    rthOpen := open
+
+// ----------------------------------------------------------------------------------------------------- 5-minute bars
+k5 = math.floor(smin / 5)
+newBlock = newSess or k5 != k5[1]
+var float o5 = na
+var float h5 = na
+var float l5 = na
+var int   n5 = 0
+if newBlock
+    o5 := open
+    h5 := high
+    l5 := low
+    n5 := 1
+else
+    h5 := math.max(h5, high)
+    l5 := math.min(l5, low)
+    n5 += 1
+blockDone = smin % 5 == 4
+
+var array<float> C5   = array.new_float()
+var array<float> H5   = array.new_float()
+var array<float> L5   = array.new_float()
+var array<float> TR5  = array.new_float()
+var array<int>   D5   = array.new_int()
+var array<int>   S5   = array.new_int()
+
+type Arm
+    int   a
+    int   d
+    float run
+    float pbx
+    int   nb
+    float isz
+    int   exp
+    int   mod      // 0 = AM_H2, 1 = MID_H2, 2 = MID_H3  (priority order when several trigger on one bar)
+    int   sid
+
+var array<Arm> arms = array.new<Arm>()
+
+f_max(array<float> arr, int i0, int i1) =>
+    float m = na
+    for q = i0 to i1
+        m := na(m) ? array.get(arr, q) : math.max(m, array.get(arr, q))
+    m
+f_min(array<float> arr, int i0, int i1) =>
+    float m = na
+    for q = i0 to i1
+        m := na(m) ? array.get(arr, q) : math.min(m, array.get(arr, q))
+    m
+
+// ----------------------------------------------------------------------------------------------------- entry machine (1m)
+// processed BEFORE new arms are created (new arms become active on the next bar: a = bar_index + 1)
+int   sigD    = 0
+float sigStop = na
+int   sigMod  = 99
+int   sigA    = 0
+nextTod = (tod + 1) % 1440
+if array.size(arms) > 0
+    for i = array.size(arms) - 1 to 0
+        Arm ar = array.get(arms, i)
+        bool dead = false
+        if bar_index >= ar.a
+            if ar.sid != sid or bar_index > ar.exp
+                dead := true
+            else
+                bool trig = false
+                float st = na
+                if ar.d > 0
+                    if ar.nb >= 1 and (ar.run - ar.pbx) >= dminK * atr1[1] and close > high[1]
+                        trig := true
+                        st := math.min(ar.pbx, low) - syminfo.mintick
+                    else if high > ar.run
+                        ar.run := high
+                        ar.pbx := na
+                        ar.nb := 0
+                    else
+                        ar.pbx := na(ar.pbx) ? low : math.min(ar.pbx, low)
+                        ar.nb += 1
+                        if ar.run - ar.pbx > retrMax * ar.isz
+                            dead := true
+                else
+                    if ar.nb >= 1 and (ar.pbx - ar.run) >= dminK * atr1[1] and close < low[1]
+                        trig := true
+                        st := math.max(ar.pbx, high) + syminfo.mintick
+                    else if low < ar.run
+                        ar.run := low
+                        ar.pbx := na
+                        ar.nb := 0
+                    else
+                        ar.pbx := na(ar.pbx) ? high : math.max(ar.pbx, high)
+                        ar.nb += 1
+                        if ar.pbx - ar.run > retrMax * ar.isz
+                            dead := true
+                if trig
+                    dead := true
+                    bool inWin = ar.mod == 0 ? (nextTod >= amStart and nextTod < amEnd) : (nextTod >= midStart and nextTod < midEnd)
+                    bool dayOk = not useDayF or (not na(rthOpen) and math.sign(close - rthOpen) == ar.d)
+                    if inWin and dayOk
+                        // priority: lowest module id, then earliest arm
+                        if ar.mod < sigMod or (ar.mod == sigMod and ar.a < sigA)
+                            sigMod  := ar.mod
+                            sigA    := ar.a
+                            sigD    := ar.d
+                            sigStop := st
+        if dead
+            array.remove(arms, i)
+
+// ----------------------------------------------------------------------------------------------------- 5m bar completion -> arms
+if blockDone
+    float pc5 = array.size(C5) > 0 ? array.get(C5, array.size(C5) - 1) : na
+    float tr5 = na(pc5) ? na : math.max(h5, pc5) - math.min(l5, pc5)
+    array.push(C5, close)
+    array.push(H5, h5)
+    array.push(L5, l5)
+    array.push(TR5, tr5)
+    array.push(S5, sid)
+    int j = array.size(C5) - 1
+    // ATR5 = SMA(20) of 5m true range (needs 20 valid values)
+    float atr5 = na
+    if j >= 19
+        float s = 0.0
+        bool ok = true
+        for q = j - 19 to j
+            float v = array.get(TR5, q)
+            if na(v)
+                ok := false
+            else
+                s += v
+        atr5 := ok ? s / 20 : na
+    // impulse direction of this 5m bar
+    int d5 = 0
+    float mv = na
+    if j >= 3 and array.get(S5, j - 3) == sid and not na(atr5)
+        mv := close - array.get(C5, j - 3)
+        d5 := mv >= impK * atr5 ? 1 : mv <= -impK * atr5 ? -1 : 0
+    array.push(D5, d5)
+    int endTod = (tod + 1) % 1440
+    // H2: impulse cluster
+    if d5 != 0 and n5 >= 4
+        bool clus = false
+        for q = math.max(0, j - clustB) to j - 1
+            if array.get(D5, q) == d5 and array.get(S5, q) == sid
+                clus := true
+        if clus
+            float ihi = f_max(H5, j - 2, j)
+            float ilo = f_min(L5, j - 2, j)
+            if useAM and endTod >= amStart and endTod <= amEnd - 15
+                array.push(arms, Arm.new(bar_index + 1, d5, d5 > 0 ? ihi : ilo, na, 0, math.abs(mv), bar_index + expH2, 0, sid))
+            if useMH2 and endTod >= midStart and endTod <= midEnd - 15
+                array.push(arms, Arm.new(bar_index + 1, d5, d5 > 0 ? ihi : ilo, na, 0, math.abs(mv), bar_index + expH2, 1, sid))
+    // H3: compression -> breakout
+    if useMH3 and j >= lookB + 1 and not na(atr5) and endTod >= midStart and endTod <= midEnd - 15
+        if array.get(S5, j - lookB - 1) == sid
+            float hiC = f_max(H5, j - lookB, j - 1)
+            float loC = f_min(L5, j - lookB, j - 1)
+            bool comp = (hiC - loC) <= compK * atr5
+            bool bigBar = (h5 - l5) >= brkK * atr5
+            if comp and bigBar and close > hiC
+                array.push(arms, Arm.new(bar_index + 1, 1, math.max(h5, hiC), na, 0, h5 - loC, bar_index + expH3, 2, sid))
+            else if comp and bigBar and close < loC
+                array.push(arms, Arm.new(bar_index + 1, -1, math.min(l5, loC), na, 0, hiC - l5, bar_index + expH3, 2, sid))
+    // keep arrays short
+    if array.size(C5) > 60
+        array.shift(C5)
+        array.shift(H5)
+        array.shift(L5)
+        array.shift(TR5)
+        array.shift(D5)
+        array.shift(S5)
+
+// ----------------------------------------------------------------------------------------------------- daily R bookkeeping
+var float dayR    = 0.0
+var float initStop = na     // initial stop of the current / last trade (defines 1R)
+var float curR    = na      // R in points of the open trade
+var float curStop = na
+var float best    = na
+var int   lastCT  = 0
+var int   nTr = 0
+var int   nWin = 0
+var float sumR = 0.0
+if newSess
+    dayR := 0.0
+if strategy.closedtrades > lastCT
+    for t = lastCT to strategy.closedtrades - 1
+        float ep = strategy.closedtrades.entry_price(t)
+        float xp = strategy.closedtrades.exit_price(t)
+        float dirT = math.sign(strategy.closedtrades.size(t))
+        float r = (xp - ep) * dirT / ((ep - initStop) * dirT)     // 1R = fill price - initial stop
+        dayR += r
+        sumR += r
+        nTr += 1
+        nWin += r > 0 ? 1 : 0
+    lastCT := strategy.closedtrades
+
+// ----------------------------------------------------------------------------------------------------- orders
+// manage open trade (decisions at bar close; stop changes act from the next bar)
+if strategy.position_size != 0
+    int d = strategy.position_size > 0 ? 1 : -1
+    float ep = strategy.opentrades.entry_price(0)
+    if na(curR) or strategy.opentrades.entry_bar_index(0) == bar_index
+        curR := (ep - initStop) * d
+        best := ep
+    best := d > 0 ? math.max(best, high) : math.min(best, low)
+    float mfe = (best - ep) * d / curR
+    float ns = curStop
+    if beTrig > 0 and mfe >= beTrig
+        ns := d > 0 ? math.max(ns, ep + beOff * curR) : math.min(ns, ep - beOff * curR)
+    if trAct > 0 and mfe >= trAct
+        ns := d > 0 ? math.max(ns, best - trDist * curR) : math.min(ns, best + trDist * curR)
+    curStop := ns
+    int barsIn = bar_index - strategy.opentrades.entry_bar_index(0) + 1
+    if barsIn >= maxBars or tod >= flatTod
+        strategy.close_all(comment = "time")
+    else
+        strategy.exit(d > 0 ? "XL" : "XS", from_entry = d > 0 ? "L" : "S", stop = curStop)
+
+// new entry (only when flat; daily limit; signal from this bar's close -> fills next bar open)
+if sigD != 0 and strategy.position_size == 0 and dayR < dayUp and dayR > dayDn
+    float fl = close - sigD * floorK * atr1
+    float st = sigD > 0 ? math.min(sigStop, fl) : math.max(sigStop, fl)
+    st := sigD > 0 ? math.floor(st / syminfo.mintick) * syminfo.mintick : math.ceil(st / syminfo.mintick) * syminfo.mintick
+    curStop := st
+    initStop := st
+    curR := na
+    string nm = sigMod == 0 ? "AM_H2" : sigMod == 1 ? "MID_H2" : "MID_H3"
+    strategy.entry(sigD > 0 ? "L" : "S", sigD > 0 ? strategy.long : strategy.short, comment = nm)
+    strategy.exit(sigD > 0 ? "XL" : "XS", from_entry = sigD > 0 ? "L" : "S", stop = st)
+
+// ----------------------------------------------------------------------------------------------------- visuals
+plot(strategy.position_size != 0 ? curStop : na, "Stop", color = color.new(#e34948, 0), style = plot.style_linebr, linewidth = 2)
+plot(rthOpen, "09:30 open", color = color.new(#52514e, 40), style = plot.style_linebr)
+bgcolor((tod >= amStart and tod < amEnd) ? color.new(#2a78d6, 94) : (tod >= midStart and tod < midEnd) ? color.new(#1baf7a, 94) : na)
+var table tb = table.new(position.top_right, 2, 5, bgcolor = color.new(#fcfcfb, 0), border_width = 1)
+if barstate.islast
+    table.cell(tb, 0, 0, "Trades", text_color = #0b0b0b)
+    table.cell(tb, 1, 0, str.tostring(nTr), text_color = #0b0b0b)
+    table.cell(tb, 0, 1, "Winrate", text_color = #0b0b0b)
+    table.cell(tb, 1, 1, nTr > 0 ? str.tostring(100.0 * nWin / nTr, "#.0") + "%" : "-", text_color = #0b0b0b)
+    table.cell(tb, 0, 2, "Expectancy (R)", text_color = #0b0b0b)
+    table.cell(tb, 1, 2, nTr > 0 ? str.tostring(sumR / nTr, "#.000") : "-", text_color = #0b0b0b)
+    table.cell(tb, 0, 3, "Total R", text_color = #0b0b0b)
+    table.cell(tb, 1, 3, str.tostring(sumR, "#.0"), text_color = #0b0b0b)
+    table.cell(tb, 0, 4, "Day R (today)", text_color = #0b0b0b)
+    table.cell(tb, 1, 4, str.tostring(dayR, "#.00"), text_color = #0b0b0b)
