@@ -1,0 +1,161 @@
+//@version=6
+// =====================================================================================================
+// NQ 08:12-09:12 ET Range – Pre-Open Sweep Reversal  (research Phase 4, research/p4)
+// CHART: NQ1! (or an NQ contract) on the 1-MINUTE timeframe. All times are America/New_York, bar START times.
+//
+// Rules (identical to research/p4/raw_events.py + simfixed.py):
+//  1) Range = high/low of the 1m bars starting 08:12 ... 09:11 ET.
+//  2) Size filter: range >= minRngDR * DR, DR = average RTH (09:30-16:00) range of the previous 10 valid sessions.
+//  3) Signal window: 1m bars starting 09:12 ... 09:29 ET. Per side, the FIRST excursion beyond the range starts a sweep
+//     (sweep extreme = most extreme price since then). Signal = a 1m CLOSE back inside the range (can be the same bar).
+//     Upper sweep -> SHORT, lower sweep -> LONG. One signal per side per day.
+//  4) Entry: market at the next bar open (it is usually held through the 09:30 cash open - that is where the edge is).
+//  5) SL  = sweep extreme +/- slBuf * range (rounded away from entry to tick).
+//     TP  = signal close +/- tpR * |signal close - SL| (rounded toward entry). Fixed, no trailing, no BE.
+//  6) Exit otherwise at the 15:54 ET bar (market, next bar open).
+//  7) Daily lock: realised R >= +1 or <= -1 -> no new trades that session. One position at a time.
+// Known differences to the research backtest: research skipped half-day/broken sessions; TradingView resolves a bar that
+// touches SL and TP in the same minute with its intrabar path model, the research counts it as SL (conservative).
+// =====================================================================================================
+strategy("NQ 08:12-09:12 Sweep Reversal", shorttitle = "NQ-SWEEP", overlay = true,
+     process_orders_on_close = false, calc_on_every_tick = false, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 100000,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.0, slippage = 0,
+     backtest_fill_limits_assumption = 1, max_bars_back = 500)
+
+// ----------------------------------------------------------------------------------------------------- inputs
+rngStart = input.int(492, "Range start (min after 00:00 ET, 492 = 08:12)")
+rngEnd   = input.int(552, "Range end, exclusive (552 = 09:12)")
+sigEnd   = input.int(570, "Signal window end, exclusive (570 = 09:30)")
+minRngDR = input.float(0.20, "Min range size (x DR)", step = 0.05)
+slBuf    = input.float(0.4, "SL beyond sweep extreme (x range)", step = 0.05)
+tpR      = input.float(2.0, "TP (R multiple)", step = 0.25)
+flatTod  = input.int(954, "Flat: exit at bar >= (954 = 15:54)")
+dayUp    = input.float(1.0, "Daily lock: realised R >= +")
+dayDn    = input.float(-1.0, "Daily lock: realised R <= ")
+drLen    = input.int(10, "DR: number of previous sessions")
+
+// ----------------------------------------------------------------------------------------------------- time / session
+TZ  = "America/New_York"
+tod = hour(time, TZ) * 60 + minute(time, TZ)
+newSess = bar_index == 0 or (tod >= 1080 and tod[1] < 1080)
+
+// DR: RTH range of previous sessions (only sessions whose RTH ran until >= 15:50 count as valid)
+var array<float> rthRanges = array.new_float()
+var float rthHi = na
+var float rthLo = na
+var int   rthLast = 0
+if newSess
+    if not na(rthHi) and rthLast >= 950
+        array.push(rthRanges, rthHi - rthLo)
+        if array.size(rthRanges) > drLen
+            array.shift(rthRanges)
+    rthHi := na
+    rthLo := na
+    rthLast := 0
+if tod >= 570 and tod < 960
+    rthHi := na(rthHi) ? high : math.max(rthHi, high)
+    rthLo := na(rthLo) ? low : math.min(rthLo, low)
+    rthLast := tod
+float DR = array.size(rthRanges) >= 5 ? array.avg(rthRanges) : na
+
+// ----------------------------------------------------------------------------------------------------- range + sweeps
+var float rHi = na
+var float rLo = na
+var int   rN  = 0
+var bool  upDone = false
+var bool  dnDone = false
+var float upExt = na      // active upper sweep extreme
+var float dnExt = na
+if newSess
+    rHi := na
+    rLo := na
+    rN := 0
+    upDone := false
+    dnDone := false
+    upExt := na
+    dnExt := na
+if tod >= rngStart and tod < rngEnd
+    rHi := na(rHi) ? high : math.max(rHi, high)
+    rLo := na(rLo) ? low : math.min(rLo, low)
+    rN += 1
+
+float size = rHi - rLo
+bool rangeOk = tod >= rngEnd and rN >= math.round((rngEnd - rngStart) * 0.8) and not na(DR) and size > 0 and size >= minRngDR * DR
+int   sigD    = 0
+float sigSL   = na
+float sigTP   = na
+if rangeOk and tod >= rngEnd and tod < sigEnd
+    // upper side -> short
+    if not upDone
+        if na(upExt) and high > rHi
+            upExt := high
+        if not na(upExt)
+            upExt := math.max(upExt, high)
+            if close < rHi
+                float sl = math.ceil((upExt + slBuf * size) / syminfo.mintick) * syminfo.mintick
+                float tp = math.ceil((close - tpR * math.abs(close - sl)) / syminfo.mintick) * syminfo.mintick
+                sigD := -1
+                sigSL := sl
+                sigTP := tp
+                upDone := true
+    // lower side -> long (research order: upper side is evaluated first within a bar)
+    if not dnDone
+        if na(dnExt) and low < rLo
+            dnExt := low
+        if not na(dnExt)
+            dnExt := math.min(dnExt, low)
+            if close > rLo
+                float sl2 = math.floor((dnExt - slBuf * size) / syminfo.mintick) * syminfo.mintick
+                float tp2 = math.floor((close + tpR * math.abs(close - sl2)) / syminfo.mintick) * syminfo.mintick
+                if sigD == 0
+                    sigD := 1
+                    sigSL := sl2
+                    sigTP := tp2
+                dnDone := true
+
+// ----------------------------------------------------------------------------------------------------- daily R bookkeeping
+var float dayR = 0.0
+var float initSL = na
+var int   lastCT = 0
+var int   nTr = 0
+var int   nWin = 0
+var float sumR = 0.0
+if newSess
+    dayR := 0.0
+if strategy.closedtrades > lastCT
+    for t = lastCT to strategy.closedtrades - 1
+        float ep = strategy.closedtrades.entry_price(t)
+        float xp = strategy.closedtrades.exit_price(t)
+        float dirT = math.sign(strategy.closedtrades.size(t))
+        float r = (xp - ep) * dirT / ((ep - initSL) * dirT)
+        dayR += r
+        sumR += r
+        nTr += 1
+        nWin += r > 0 ? 1 : 0
+    lastCT := strategy.closedtrades
+
+// ----------------------------------------------------------------------------------------------------- orders
+if strategy.position_size != 0 and tod >= flatTod
+    strategy.close_all(comment = "time")
+
+if sigD != 0 and strategy.position_size == 0 and dayR < dayUp and dayR > dayDn
+    initSL := sigSL
+    string id = sigD > 0 ? "L" : "S"
+    strategy.entry(id, sigD > 0 ? strategy.long : strategy.short)
+    strategy.exit("X" + id, from_entry = id, stop = sigSL, limit = sigTP)
+
+// ----------------------------------------------------------------------------------------------------- visuals
+plot(tod >= rngEnd and tod < 960 ? rHi : na, "Range high", color = color.new(#2a78d6, 0), style = plot.style_linebr)
+plot(tod >= rngEnd and tod < 960 ? rLo : na, "Range low", color = color.new(#2a78d6, 0), style = plot.style_linebr)
+bgcolor(tod >= rngStart and tod < rngEnd ? color.new(#2a78d6, 92) : tod >= rngEnd and tod < sigEnd ? color.new(#eb6834, 92) : na)
+var table tb = table.new(position.top_right, 2, 4, bgcolor = color.new(#fcfcfb, 0), border_width = 1)
+if barstate.islast
+    table.cell(tb, 0, 0, "Trades", text_color = #0b0b0b)
+    table.cell(tb, 1, 0, str.tostring(nTr), text_color = #0b0b0b)
+    table.cell(tb, 0, 1, "Winrate", text_color = #0b0b0b)
+    table.cell(tb, 1, 1, nTr > 0 ? str.tostring(100.0 * nWin / nTr, "#.0") + "%" : "-", text_color = #0b0b0b)
+    table.cell(tb, 0, 2, "Expectancy (R)", text_color = #0b0b0b)
+    table.cell(tb, 1, 2, nTr > 0 ? str.tostring(sumR / nTr, "#.000") : "-", text_color = #0b0b0b)
+    table.cell(tb, 0, 3, "Total R", text_color = #0b0b0b)
+    table.cell(tb, 1, 3, str.tostring(sumR, "#.0"), text_color = #0b0b0b)
